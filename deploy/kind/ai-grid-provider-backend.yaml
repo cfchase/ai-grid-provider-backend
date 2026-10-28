@@ -31,18 +31,14 @@ rules:
   - apiGroups: ["register.open-cluster-management.io"]
     resources: ["managedclusters/accept"]
     verbs: ["update"]
-  # Clusters read the ai-grid-ready Policy; Models and Subscriptions read
-  # status from the status Policies and their per-cluster copies (same names
-  # as deploy/openshift/rbac.yaml). Kind has no ACM Policies, so these reads
-  # find nothing and the APIs report no status.
+  # Clusters read the ai-grid-ready Policy. Kind has no ACM, so this read
+  # finds nothing. Models and Subscriptions would read status from the
+  # catalog's Argo CD Applications (deploy/openshift/rbac.yaml); kind has no
+  # Argo CD, so nothing grants it and the APIs report no status.
   - apiGroups: ["policy.open-cluster-management.io"]
     resources: ["policies"]
     resourceNames:
       - ai-grid-ready
-      - ai-grid-models-status
-      - ai-grid-catalog-status
-      - ai-grid-policies.ai-grid-models-status
-      - ai-grid-policies.ai-grid-catalog-status
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

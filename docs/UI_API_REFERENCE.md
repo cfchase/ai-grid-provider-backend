@@ -549,13 +549,14 @@ ManagedCluster on the hub, or the call is `InvalidArgument` naming it, with a
 cluster the model is already on is not checked again, so a model on a cluster
 that has left the hub can still be changed or moved off it.
 `:listPlacementClusters` lists the clusters a model can run on. Status comes
-from the hub's status Policies, or reason
+from the hub's catalog Argo CD Applications, or reason
 `SavedToGit` with no phase when no cluster has reported. Once one has,
 `status.phase` is `MODEL_PHASE_READY`, `MODEL_PHASE_PARTIALLY_AVAILABLE`
 (ready on some placed clusters, not all, and published on every ingress
-cluster) or `MODEL_PHASE_PENDING`; READY and PARTIALLY_AVAILABLE need at least
+cluster), `MODEL_PHASE_FAILED` (a cluster reports it failed) or
+`MODEL_PHASE_PENDING`; READY and PARTIALLY_AVAILABLE need at least
 one ingress cluster's report, and a cluster labelled `ai-grid/role` `ingress` or
-`combined` must report even before the catalog Policy lists it; in that order of precedence (the comment on
+`combined` must report even before it has an ingress Application; in that order of precedence (the comment on
 `ModelPhase`), and `status.clusters` gives each placed cluster's own status
 (below). `spec.main.requests` and `limits` take Kubernetes quantities with
 Kubernetes' container rules: non-negative, whole numbers for extended
@@ -712,11 +713,11 @@ these return the full gRPC response wrapper:
 - `GET /subscriptions` list remains `{ size, total, items }`
 
 `authPolicies` on Get (and `authPolicy` on Create) is the subscription's
-managed policy, with `phase` `Active` or `Pending` and a `Ready` condition
-saying where it is active, from the hub's status Policies, or no phase and no
-conditions when no cluster has reported. `modelRegistrations`
-has one entry per model ref, with phase `Ready` or `Pending` from the hub's
-status Policies, or reason `SavedToGit` and no phase when no cluster has
+managed policy, with `phase` `Active`, `Degraded` or `Pending` and a `Ready`
+condition saying where it is ready, from the hub's catalog Applications, or
+no phase and no conditions when no cluster has reported. `modelRegistrations`
+has one entry per model ref, with phase `Ready`, `Failed` or `Pending` from the hub's
+catalog Applications, or reason `SavedToGit` and no phase when no cluster has
 reported.
 
 **Go client note:** `client.GetSubscription` returns only the Subscription
@@ -776,7 +777,7 @@ Subscription ids must leave room for the `-policy` suffix (max 56 chars).
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `phase` | string | `Active` or `Pending` from the hub's status Policies; empty when no ingress cluster has reported |
+| `phase` | string | `Active`, `Pending` or `Degraded` from the hub's catalog Applications; empty when no cluster has reported |
 | `conditions[]` | Condition | Not read back; empty |
 | `model_ref_statuses[]` | ResourceRefStatus | Not read back; empty |
 | `token_rate_limit_statuses[]` | object | Not read back; empty |

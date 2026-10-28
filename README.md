@@ -157,7 +157,7 @@ The Models and Subscriptions RPCs write only to a Git repository, and Argo CD
 delivers the files to the clusters; the backend never creates, updates or
 deletes a model or subscription object on a cluster. Each create, update or
 delete is one commit to the branch. Reads come from the repository too, and
-status from the hub's ACM Policies ([Status](#status-from-the-spokes)).
+status from the hub's Argo CD Applications ([Status](#status-from-the-spokes)).
 
 | Setting | Meaning |
 |---|---|
@@ -166,7 +166,10 @@ status from the hub's ACM Policies ([Status](#status-from-the-spokes)).
 | `AI_GRID_GIT_TOKEN_FILE` | File holding a GitHub personal access token with `contents: write` on that repository only, for example a mounted Secret. Sent as HTTPS basic auth, so `AI_GRID_GIT_URL` must be `https://` when it is set; never logged. |
 | `AI_GRID_MODELS_NAMESPACE` | Namespace of each model's `LLMInferenceService` on the inference spokes. Default `ai-grid-internal-models`. An override must name a namespace that's already enabled for grid routing on every inference spoke: labelled `grid.opendatahub.io/allowed: "true"`, allowed by the inference Gateway's `allowedRoutes`, and with NetworkPolicies that let the grid reach the model and its scheduler's metrics. The backend writes one NetworkPolicy per model that admits the grid namespace; the namespace and its other policies come from the environment. |
 | `AI_GRID_SUBSCRIPTION_NAMESPACE` | Namespace of the subscriptions, their policies and the models' catalog entries on the ingress spokes. Default `models-as-a-service`. |
-| `AI_GRID_POLICY_NAMESPACE` | Hub namespace of the ACM Policies that status is read from. Default `ai-grid-policies`. |
+| `AI_GRID_CATALOG_APP_NAMESPACE` | Hub namespace of the catalog's Argo CD ApplicationSets and Applications, which status is read from. Default `openshift-gitops`. |
+| `AI_GRID_CATALOG_MODELS_APPSET` | ApplicationSet that delivers each cluster's models (`catalog/clusters/<cluster>/`). Default `acm-models-catalog-models`. |
+| `AI_GRID_CATALOG_INGRESS_APPSET` | ApplicationSet that delivers every model's `ExternalModel` and `MaaSModelRef` (`catalog/ingress/`). Default `acm-models-catalog-ingress`. |
+| `AI_GRID_CATALOG_SUBSCRIPTIONS_APPSET` | ApplicationSet that delivers every subscription (`catalog/subscriptions/`). Default `acm-models-catalog-subscriptions`. |
 | `AI_GRID_GRID_NAMESPACE` | Namespace of the grid on the inference spokes, which each model's NetworkPolicy admits. Default `redhat-ai-grid`. |
 
 The repository holds:
@@ -238,14 +241,14 @@ For subscriptions:
   filter `this.spec.model_refs.exists(r, r.model_id == "<id>")`, without
   knowing any namespace.
 - `status.phase` comes from the spokes (see "Status from the spokes" below):
-  `Active` when every ingress cluster the status Policy is placed on has it
-  active; `Pending` when any has it not active, doesn't have it yet, or hasn't
-  reported; and empty when no cluster has reported. `Get` and `Create`
-  return the file's policy with its `phase` set the same way from the
-  `auth-policies-active` reports (`Active` or `Pending`, empty with no
-  report) and a `Ready` condition whose message says where it is active,
-  such as `Ready on site-a`. `Get` also returns one `model_registrations` entry per model
-  ref: phase `Ready` or `Pending` from the clusters' `MaaSModelRef` reports,
+  `Active` when every cluster with a subscriptions Application reports it
+  ready; `Degraded` when any reports it failed; `Pending` when any reports it
+  pending or doesn't list it yet; and empty when no cluster has reported.
+  `Get` and `Create` return the file's policy with the same phases from its
+  `MaaSAuthPolicy` reports, and a `Ready` condition whose message says where
+  it is ready, such as `Ready on site-a`. `Get` also returns one
+  `model_registrations` entry per model
+  ref: phase `Ready`, `Failed` or `Pending` from the clusters' `MaaSModelRef` reports,
   or, with no report, no phase and a `Ready` condition of unknown status,
   reason `SavedToGit`, so a client doesn't take the models as missing.
 - Keep a file that isn't `*.yaml`, such as a `README`, in
@@ -303,21 +306,23 @@ For models:
   `location` labels (`locations`, read from the ManagedClusters; not cluster
   names). `status.clusters` has one entry per placed cluster: `READY`,
   reason `Ready`, when the cluster reports the `LLMInferenceService` ready
-  (and, on a combined cluster, the `MaaSModelRef` too); `PENDING`, reason
-  `NotReady`, when a report says not ready; `PENDING`, reason `NoReport`,
-  when one is missing; its message says what the cluster reported, such as
-  `LLMInferenceService ready; MaaSModelRef not ready`. `status.phase` is
-  `READY` when every placed cluster is ready and every ingress cluster (the
-  ones the catalog status Policy is placed on, and the ones labelled
-  `ai-grid/enabled: "true"` and `ai-grid/role` `ingress` or `combined`) has
-  its `MaaSModelRef` ready, and there is at least one;
-  `PARTIALLY_AVAILABLE`, reason `PartiallyAvailable`, when every ingress
-  cluster has the `MaaSModelRef` ready and some, not all, placed clusters are
-  ready, with at least one ingress cluster too; otherwise `PENDING`, reason
-  `NotReady`. The message covers every
-  cluster, such as `Not ready on site-a; ready on site-b`. With no report at
-  all, it has no phase, reason `SavedToGit` and no `clusters`. It is never
-  `FAILED`: the Policies can't tell a failed model from one that is starting.
+  (and, on a combined cluster, the `MaaSModelRef` and `ExternalModel` too);
+  `FAILED`, reason `Failed`, when one of them is failed; `PENDING`, reason
+  `NotReady`, when one is pending; `PENDING`, reason `NoReport`, when one is
+  missing. Its message says what the cluster reported, such as
+  `LLMInferenceService ready; MaaSModelRef not ready; ExternalModel ready`.
+  `status.phase` is, in this order: `READY` when every placed cluster is
+  ready and every ingress cluster (the ones with an ingress Application, and
+  the ones labelled `ai-grid/enabled: "true"` and `ai-grid/role` `ingress`
+  or `combined`) reports its `MaaSModelRef` and `ExternalModel` ready, and
+  there is at least one; `PARTIALLY_AVAILABLE`, reason `PartiallyAvailable`,
+  when every ingress cluster is ready and some, not all, placed clusters
+  are, with at least one ingress cluster too; `FAILED`, reason `Failed`,
+  when any cluster reports one of them failed; otherwise `PENDING`, reason
+  `NotReady`. The message covers every cluster, such as `Failed on site-a;
+  ready on site-b`, followed by Argo CD's message for each failed object.
+  With no report at all, it has no phase, reason `SavedToGit` and no
+  `clusters`.
 - `spec.main.requests` and `limits` must be Kubernetes quantities that
   Kubernetes accepts for a container: non-negative, whole numbers for
   extended resources such as `nvidia.com/gpu`, a request at most its limit,
@@ -331,35 +336,47 @@ For models:
 
 #### Status from the spokes
 
-The backend reads status back from two inform-only ACM Policies on the hub, in
-`AI_GRID_POLICY_NAMESPACE` (default `ai-grid-policies`), which the environment
-deploys:
+The backend reads status back from the hub's Argo CD, which delivers the
+catalog. Three ApplicationSets in `AI_GRID_CATALOG_APP_NAMESPACE` (default
+`openshift-gitops`) each generate one Application per cluster, named
+`<ApplicationSet>-<cluster>` (kahowell/ai-grid-tenant
+`apps/acm-models/hub/catalog-04-applicationsets.yaml`):
 
-| Policy | Spokes | ConfigurationPolicy | Checks |
-|---|---|---|---|
-| `ai-grid-models-status` | inference, combined | `models-ready` | each `LLMInferenceService` has `Ready=True` |
-| `ai-grid-catalog-status` | ingress, combined | `model-refs-ready` | each `MaaSModelRef` has phase `Ready` |
-| | | `subscriptions-active` | each `MaaSSubscription` has phase `Active` |
-| | | `auth-policies-active` | each `MaaSAuthPolicy` has phase `Active` |
+| ApplicationSet | Delivers | Kinds read |
+|---|---|---|
+| `acm-models-catalog-models` | the cluster's models | `LLMInferenceService` |
+| `acm-models-catalog-ingress` | every model's MaaS entries | `MaaSModelRef`, `ExternalModel` |
+| `acm-models-catalog-subscriptions` | every subscription | `MaaSSubscription`, `MaaSAuthPolicy` |
 
-The backend reads the root Policy's `status.status` for the clusters, then
-each cluster's copy (`<namespace>.<policy>` in the cluster's namespace) for
-the latest message of each ConfigurationPolicy, which names each object as
-found as specified (ready), found but not as specified, or not found. The
-ConfigurationPolicies look up every object of their kind, so a cluster whose
-report doesn't name an object doesn't have it yet. It reads on every request, with no cache,
-which suits the handful of clusters a grid has. The ServiceAccount needs
-`get` on the two roots and their copies (`deploy/openshift/rbac.yaml`). A
-Policy that is missing or forbidden means no report, not an error, so the
-backend works before the Policies are deployed.
+An Application counts only when its ApplicationSet owns it. For each resource
+in its `status.resources[]`, `Synced` and health `Healthy` is ready; health
+`Degraded`, or out of sync after a failed sync, is failed; out of sync while
+Argo CD retries a failed sync (such as an AppProject refusing the kind or
+namespace, which shows only in `status.operationState.message`) is pending
+with that message; anything else
+(`OutOfSync`, `Progressing`, `Missing`, no health) is pending, because the live
+object is then the previous revision or still starting. A resource the
+Application doesn't list isn't on that cluster yet. The health comes from the
+hub's Argo CD resource health checks, which the hub must have for
+`LLMInferenceService`, `ExternalModel`, `MaaSModelRef`, `MaaSSubscription` and
+`MaaSAuthPolicy`, as kahowell/ai-grid-tenant's `apps/gitops-config/manifests/argocd.yaml`
+does: Argo CD has none built in, and without them every model and subscription
+stays pending. A model the file places on a cluster that has no models
+Application (not yet created, or the cluster left the catalog's Placement)
+reads "no report from" that cluster and stays pending until the placement
+changes. Until some cluster lists a new model, it stays saved to Git.
+It reads on every request, with no cache, which suits the handful of clusters
+a grid has. The ServiceAccount needs `get` and `list` on Applications in that
+namespace, which lets it read every Application there, so keep secrets out of
+their specs (inline Helm values, plugin settings). A missing or forbidden list means no report, not an error, so the
+backend works without Argo CD.
 
 The service runs in-cluster using its Kubernetes ServiceAccount. Its RBAC role
 (`deploy/openshift/rbac.yaml`, and the same rules for Kind) writes only
 ManagedClusters: `get`, `list`, `watch`, `create`, `update`, `patch` and
 `delete` on `ManagedCluster` resources, plus the ManagedClusterSet join and
 accept subresources the Clusters API needs. Otherwise it may only `get` the
-`ai-grid-ready` Policy and the two status Policies and their per-cluster
-copies. It has no rights on MaaS, KServe or ACM placement objects: Models and
+`ai-grid-ready` Policy and `get` and `list` Argo CD Applications in `openshift-gitops`. It has no rights on MaaS, KServe or ACM placement objects: Models and
 Subscriptions write to Git. `internal/deploycheck` fails on a write verb
 outside the ManagedCluster rules.
 
@@ -662,7 +679,7 @@ make dev-fake
 ├── bin/ai-grid-fake-infra --fixtures fixtures/default --draft-fixtures fixtures/draft/default
 │   ├── fake hub API   127.0.0.1:9091  ManagedClusters + SelfSubjectAccessReview
 │   │                                  (TLS for the backend, plain HTTP for the console BFF),
-│   │                                  the status Policies (fixtures/default/policies.json)
+│   │                                  the catalog's Argo CD Applications (fixtures/default/applications.json)
 │   │                                  and a fake ACM Search at /searchapi/graphql (GPU nodes)
 │   ├── fake Keycloak  127.0.0.1:9093  token endpoint + Organizations Admin API
 │   └── draft fake     127.0.0.1:9094  gRPC ai_grid.draft.v1, the console's draft API (own state)
@@ -685,7 +702,7 @@ preset contains and where it comes from.
 
 ```sh
 make dev-fake                         # fixtures/default: ten clusters in every ACM state, six organizations,
-                                      # status Policies, and a timeline
+                                      # catalog Applications, and a timeline
                                       # (a cluster joins at 20s, one detaches at 30s, ...)
 make dev-fake-poc                     # fixtures/poc: the PoC's four sites and three organizations, static
                                       # (and fixtures/draft/poc for the draft fake)
@@ -755,9 +772,9 @@ delivered.
 `make dev-fake` commits to `bin/dev-catalog.git` (`DEV_CATALOG`), a bare
 repository that it creates on first run with one seed commit holding
 `catalog/subscriptions/README`. `bin/` is git-ignored, and the repository
-survives restarts. The fake hub serves the status Policies from
-`fixtures/default/policies.json`, so models and subscriptions named there show
-status.
+survives restarts. The fake hub serves the catalog's Applications from
+`fixtures/default/applications.json`, so models and subscriptions named there
+show status.
 
 ```sh
 make dev-fake                         # terminal 1
@@ -802,8 +819,8 @@ spokes without touching anyone else's:
    holding a fine-grained token with `contents: write` on the fork only:
    locally with `make run` against the dev cluster's kubeconfig, or deployed
    with `make openshift-up`.
-4. Create a model or subscription, then watch Argo CD sync it and the status
-   Policies report it.
+4. Create a model or subscription, then watch Argo CD sync it and report its
+   health.
 
 ## The console's draft API (ai_grid.draft.v1)
 

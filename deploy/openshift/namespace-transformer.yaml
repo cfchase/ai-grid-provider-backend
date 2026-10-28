@@ -1,0 +1,11 @@
+# Puts every object without a namespace in ai-grid, as a kustomization's
+# namespace: would, but leaves an object that names its own namespace alone:
+# the Role in rbac.yaml that reads the catalog's Argo CD Applications must stay
+# in openshift-gitops.
+apiVersion: builtin
+kind: NamespaceTransformer
+metadata:
+  name: ai-grid
+  namespace: ai-grid
+unsetOnly: true
+setRoleBindingSubjects: none

@@ -29,20 +29,13 @@ rules:
   # where ACM renders hub templates such as fromSecret, stay unreadable. A
   # Role in ai-grid-policies would be narrower, but this kustomization's
   # namespace: ai-grid would move it. Change the name here if you change
-  # AI_GRID_READY_POLICY.
-  # Models and Subscriptions read their status from the inform-only
-  # ai-grid-models-status and ai-grid-catalog-status Policies: the roots, and
-  # each cluster's copy (<AI_GRID_POLICY_NAMESPACE>.<policy> in the cluster's
-  # namespace). Without these names models show as saved to Git and
-  # subscriptions with no phase.
+  # AI_GRID_READY_POLICY. Models and Subscriptions read their status from
+  # the catalog's Argo CD Applications instead: the Role at the end of this
+  # file.
   - apiGroups: ["policy.open-cluster-management.io"]
     resources: ["policies"]
     resourceNames:
       - ai-grid-ready
-      - ai-grid-models-status
-      - ai-grid-catalog-status
-      - ai-grid-policies.ai-grid-models-status
-      - ai-grid-policies.ai-grid-catalog-status
     verbs: ["get"]
   # Clusters List/Get read each cluster's GPUs from ACM Search (--search-api-url).
   # Search shows a caller the resources of every managed cluster when it may
@@ -67,6 +60,38 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: ai-grid-provider-backend-managedclusters
+subjects:
+  - kind: ServiceAccount
+    name: ai-grid-provider-backend
+    namespace: ai-grid
+---
+# Models and Subscriptions read their status from the health of the catalog's
+# Argo CD Applications in openshift-gitops (AI_GRID_CATALOG_APP_NAMESPACE).
+# Without this Role, models show as saved to Git and subscriptions with no
+# phase. list can't be limited by name, so the backend can read every
+# Application in openshift-gitops, including any inline Helm values or plugin
+# settings their specs carry; keep secrets out of Application specs there.
+# Change the namespace here if you change AI_GRID_CATALOG_APP_NAMESPACE (the
+# kustomization's NamespaceTransformer leaves it alone).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-grid-provider-backend-catalog-status
+  namespace: openshift-gitops
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-grid-provider-backend-catalog-status
+  namespace: openshift-gitops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-grid-provider-backend-catalog-status
 subjects:
   - kind: ServiceAccount
     name: ai-grid-provider-backend
