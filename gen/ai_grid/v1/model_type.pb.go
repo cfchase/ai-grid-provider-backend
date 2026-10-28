@@ -82,22 +82,23 @@ func (ModelRolloutStrategy) EnumDescriptor() ([]byte, []int) {
 // order of precedence:
 //
 //   - READY (reason Ready): every ingress cluster reports the model's
-//     MaaSModelRef ready, and every placed cluster is READY in `clusters`.
+//     MaaSModelRef and ExternalModel ready, and every placed cluster is
+//     READY in `clusters`.
 //   - PARTIALLY_AVAILABLE (reason PartiallyAvailable): every ingress cluster
-//     reports the MaaSModelRef ready, at least one placed cluster is READY
-//     and at least one is not.
+//     reports them ready, at least one placed cluster is READY and at least
+//     one is not.
+//   - FAILED (reason Failed): a cluster reports one of the model's objects
+//     failed: Argo CD health Degraded, or its sync failed.
 //   - PENDING (reason NotReady): otherwise, including while an ingress
 //     cluster reports the MaaSModelRef not ready or hasn't reported it.
 //
-// The ingress clusters are those the catalog status Policy lists and those
+// The ingress clusters are those with a catalog ingress Application and those
 // labelled ai-grid/enabled "true" and ai-grid/role ingress or combined; each
 // must report. READY and PARTIALLY_AVAILABLE need at least one: with none,
 // nothing shows the model published, so it is PENDING, and the message ends
 // "no ingress cluster has reported the MaaSModelRef".
 //
-// Git mode never reports FAILED: the status Policies can't tell a model
-// that failed from one that is still starting. The order is the one the
-// console's Models page uses (READY, PARTIALLY_AVAILABLE, FAILED, then the
+// The order is the one the console's Models page uses (READY, PARTIALLY_AVAILABLE, FAILED, then the
 // PENDING cases; proposal P13).
 type ModelPhase int32
 
@@ -108,7 +109,7 @@ const (
 	ModelPhase_MODEL_PHASE_FAILED      ModelPhase = 3
 	// Serving on some of the clusters its placement names but not all (see
 	// above). Only a whole model has it; a cluster in ModelStatus.clusters is
-	// READY or PENDING.
+	// READY, FAILED or PENDING.
 	ModelPhase_MODEL_PHASE_PARTIALLY_AVAILABLE ModelPhase = 4
 )
 
@@ -1116,7 +1117,7 @@ type ModelStatus struct {
 	ObservedGeneration int64 `protobuf:"varint,8,opt,name=observed_generation,json=observedGeneration,proto3" json:"observed_generation,omitempty"`
 	// The model on each cluster its placement names (the clusters in
 	// placement.selected_clusters), one entry per cluster in cluster-name
-	// order, from what the hub's status Policies report. Empty while no
+	// order, from what the hub's catalog Argo CD Applications report. Empty while no
 	// cluster has reported (reason SavedToGit). Ingress clusters the model
 	// isn't placed on, which publish it but don't run it, have no entry; their
 	// reports count in `phase` and `message`. Output only.
@@ -1218,24 +1219,24 @@ func (x *ModelStatus) GetClusters() []*ModelClusterStatus {
 	return nil
 }
 
-// The model on one placed cluster. In git mode it comes from the hub's
-// status Policies: the cluster's models-ready report of the model's
-// LLMInferenceService (Ready=True), and, on a combined cluster, which is
-// also an ingress cluster, its model-refs-ready report of the model's
-// MaaSModelRef (phase Ready). Output only.
+// The model on one placed cluster. In git mode it comes from the health the
+// hub's catalog Argo CD Applications record for the cluster's
+// LLMInferenceService and, on a combined cluster, which is also an ingress
+// cluster, for its MaaSModelRef and ExternalModel. Output only.
 type ModelClusterStatus struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// ManagedCluster name, one of placement.selected_clusters.
 	Cluster string `protobuf:"bytes,1,opt,name=cluster,proto3" json:"cluster,omitempty"`
-	// READY when every report from the cluster says ready; PENDING when one
-	// says not ready (or not found) or one is missing. Git mode never sets
-	// FAILED; PARTIALLY_AVAILABLE is only a whole model's phase.
+	// READY when every report from the cluster says ready; FAILED when one
+	// says failed; PENDING when one says not ready or one is missing.
+	// PARTIALLY_AVAILABLE is only a whole model's phase.
 	Phase ModelPhase `protobuf:"varint,2,opt,name=phase,proto3,enum=ai_grid.v1.ModelPhase" json:"phase,omitempty"`
-	// Ready, NotReady (a report says not ready or not found) or NoReport (the
+	// Ready, Failed, NotReady (a report says not ready) or NoReport (the
 	// cluster hasn't reported the object yet).
 	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
 	// What the cluster reported, for example "LLMInferenceService not ready"
-	// or "LLMInferenceService ready; no MaaSModelRef report".
+	// or "LLMInferenceService ready; no MaaSModelRef report; no ExternalModel
+	// report".
 	Message       string `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

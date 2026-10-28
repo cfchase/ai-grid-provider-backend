@@ -3,7 +3,9 @@ package servers
 import (
 	"context"
 	"errors"
-	"maps"
+	"log/slog"
+	"reflect"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,192 +16,314 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 )
 
-// Messages as ACM reports them on demo1 and site-b.
-const (
-	msgReadyPolicy        = "Compliant; notification - datascienceclusters [default-dsc] found as specified; notification - deployments [grid-operator] found as specified in namespace grid"
-	msgReadyPolicyViolate = "NonCompliant; notification - datascienceclusters [default-dsc] found as specified; violation - deployments [grid-operator] found but not as specified in namespace grid"
-	msgModelReady         = "llminferenceservices [granite-4-tiny] found as specified in namespace ai-grid-internal-models"
-	msgModelNotReady      = "llminferenceservices [granite-4-tiny] found but not as specified in namespace ai-grid-internal-models"
-	msgEmpty              = "models-ready contains no object templates to check, and thus has no violations"
-	msgTemplateFailure    = "failed to resolve the template {\"apiVersion\":\"policy.open-cluster-management.io/v1\"}: template: tmpl:3: function \"lookup\" not defined"
-)
-
-func TestParseCompliance(t *testing.T) {
-	t.Parallel()
-	for name, tc := range map[string]struct {
-		message string
-		want    map[string]bool
-		wantOK  bool
-	}{
-		"compliant":        {msgReadyPolicy, map[string]bool{"default-dsc": true, "grid-operator": true}, true},
-		"mixed clauses":    {msgReadyPolicyViolate, map[string]bool{"default-dsc": true, "grid-operator": false}, true},
-		"ready":            {msgModelReady, map[string]bool{"granite-4-tiny": true}, true},
-		"not ready":        {msgModelNotReady, map[string]bool{"granite-4-tiny": false}, true},
-		"several names":    {"NonCompliant; violation - llminferenceservices [a, b] found but not as specified in namespace m; notification - llminferenceservices [c] found as specified in namespace m", map[string]bool{"a": false, "b": false, "c": true}, true},
-		"not found":        {"NonCompliant; violation - maassubscriptions [a] not found in namespace m; notification - maassubscriptions [b] found as specified in namespace m", map[string]bool{"a": false, "b": true}, true},
-		"not ready wins":   {"llminferenceservices [a] found but not as specified in namespace m; llminferenceservices [a] found as specified in namespace m", map[string]bool{"a": false}, true},
-		"auth policies":    {"Compliant; notification - maasauthpolicies [granite-org1-policy] found as specified in namespace models-as-a-service; notification - maasauthpolicies [opt-125m-org1] found as specified in namespace models-as-a-service", map[string]bool{"granite-org1-policy": true, "opt-125m-org1": true}, true},
-		"nothing to check": {msgEmpty, map[string]bool{}, true},
-		"template failure": {msgTemplateFailure, nil, false},
-		"empty":            {"", nil, false},
-		"unrecognised":     {"Compliant; something else entirely", nil, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			got, ok := parseCompliance(tc.message)
-			if ok != tc.wantOK || !maps.Equal(got, tc.want) {
-				t.Fatalf("parseCompliance() = %v, %v; want %v, %v", got, ok, tc.want, tc.wantOK)
-			}
-		})
+// appResource is one entry of an Application's status.resources. An empty
+// health leaves health out, as Argo CD does for kinds it has no check for.
+func appResource(kind, name, sync, health, message string) map[string]interface{} {
+	out := map[string]interface{}{"kind": kind, "name": name, "namespace": "ns", "status": sync}
+	if health != "" {
+		out["health"] = map[string]interface{}{"status": health, "message": message}
 	}
+	return out
+}
+
+// application is the Application ApplicationSet appSet generates for
+// cluster, in the default namespace, listing resources.
+func application(appSet, cluster string, resources ...map[string]interface{}) *unstructured.Unstructured {
+	return applicationNamed(appSet+"-"+cluster, appSet, resources...)
+}
+
+// applicationNamed is an Application called name, owned by ApplicationSet
+// owner (none when empty).
+func applicationNamed(name, owner string, resources ...map[string]interface{}) *unstructured.Unstructured {
+	list := make([]interface{}, 0, len(resources))
+	for _, r := range resources {
+		list = append(list, r)
+	}
+	metadata := map[string]interface{}{"name": name, "namespace": DefaultCatalogAppNamespace}
+	if owner != "" {
+		metadata["ownerReferences"] = []interface{}{map[string]interface{}{
+			"apiVersion": "argoproj.io/v1alpha1", "kind": "ApplicationSet", "name": owner, "uid": "u-" + owner,
+		}}
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "argoproj.io/v1alpha1",
+		"kind":       "Application",
+		"metadata":   metadata,
+		"status":     map[string]interface{}{"resources": list},
+	}}
+}
+
+// withSyncFailure marks an Application's last sync Failed with message.
+// The failed sync was to the revision the Application wants, r2.
+func withSyncFailure(app *unstructured.Unstructured, message string) *unstructured.Unstructured {
+	return withSyncFailureAt(app, message, "r2")
+}
+
+// withSyncFailureAt marks a failed sync to revision tried, while the
+// Application wants r2.
+func withSyncFailureAt(app *unstructured.Unstructured, message, tried string) *unstructured.Unstructured {
+	_ = unstructured.SetNestedMap(app.Object, map[string]interface{}{
+		"phase": "Failed", "message": message, "syncResult": map[string]interface{}{"revision": tried},
+	}, "status", "operationState")
+	_ = unstructured.SetNestedField(app.Object, "r2", "status", "sync", "revision")
+	return app
+}
+
+// withRetry marks a sync to r2 that failed and that Argo CD is retrying.
+func withRetry(app *unstructured.Unstructured, message string, retries int64) *unstructured.Unstructured {
+	_ = unstructured.SetNestedMap(app.Object, map[string]interface{}{
+		"phase": "Running", "message": message, "retryCount": retries,
+		"syncResult": map[string]interface{}{"revision": "r2"},
+	}, "status", "operationState")
+	_ = unstructured.SetNestedField(app.Object, "r2", "status", "sync", "revision")
+	return app
+}
+
+// refusal is what an AppProject that refuses a kind or namespace leaves in
+// operationState.message (demo1, 2026-10-28).
+const refusal = "one or more synchronization tasks are not valid (retried 2 times). resource serving.kserve.io:LLMInferenceService is not permitted in project acm-models-catalog-models"
+
+// pruning marks a resource as one Argo CD is about to prune.
+func pruning(res map[string]interface{}) map[string]interface{} {
+	res["requiresPruning"] = true
+	return res
+}
+
+func newAppClient(objects ...runtime.Object) *fake.FakeDynamicClient {
+	return fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{applicationsResource: "ApplicationList", managedClustersResource: "ManagedClusterList"},
+		objects...,
+	)
 }
 
 func TestCatalogStatusRead(t *testing.T) {
 	t.Parallel()
-	client := newPolicyClient(
-		rootPolicy("ai-grid-models-status", "site-a", "site-b", "site-c", "site-d"),
-		clusterPolicy("site-a", "ai-grid-models-status", map[string]string{"models-ready": msgModelReady, "other": msgModelNotReady}),
-		clusterPolicy("site-b", "ai-grid-models-status", map[string]string{"models-ready": msgModelNotReady}),
-		clusterPolicy("site-c", "ai-grid-models-status", map[string]string{"models-ready": msgTemplateFailure}),
-		// site-d has no copy yet.
-	)
-	got, err := NewCatalogStatusReader(client, "").Read(context.Background(), "ai-grid-models-status", "models-ready")
-	if err != nil {
-		t.Fatalf("Read() error = %v", err)
-	}
-	// Every cluster the Policy is placed on is in the result; one without a
-	// usable report maps to nil.
-	want := ObjectReports{"site-a": {"granite-4-tiny": true}, "site-b": {"granite-4-tiny": false}, "site-c": nil, "site-d": nil}
-	if !maps.EqualFunc(got, want, func(a, b map[string]bool) bool { return (a == nil) == (b == nil) && maps.Equal(a, b) }) {
-		t.Fatalf("Read() = %v, want %v", got, want)
-	}
-}
-
-// TestCatalogStatusReadHub reads each check the backend uses from the
-// Policies of a real hub (testdata/hub-status-policies.json), so a check name
-// the Policies don't have fails here.
-func TestCatalogStatusReadHub(t *testing.T) {
-	t.Parallel()
-	reader := NewCatalogStatusReader(newPolicyClient(hubStatusPolicies(t)...), "")
-	for _, tc := range []struct {
-		policy, check string
-		want          ObjectReports
+	const models = DefaultCatalogModelsAppSet
+	for name, tc := range map[string]struct {
+		app  *unstructured.Unstructured
+		want map[string]ObjectReport
 	}{
-		{modelsStatusPolicy, modelsReadyCheck, ObjectReports{"site-a": {}, "site-b": {"granite-4-tiny": true}}},
-		{catalogStatusPolicy, modelRefsReadyCheck, ObjectReports{"site-a": {"facebook-opt-125m": true, "granite-4-tiny": true}}},
-		{catalogStatusPolicy, subscriptionsActiveCheck, ObjectReports{"site-a": {"granite-org1": true, "opt-125m-org1": true}}},
-		{catalogStatusPolicy, authPoliciesActiveCheck, ObjectReports{"site-a": {"granite-org1-policy": true, "opt-125m-org1": true}}},
+		"synced and healthy is ready": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "Healthy", "LLMInferenceService is ready")),
+			want: map[string]ObjectReport{"m": {State: StateReady, Message: "LLMInferenceService is ready"}},
+		},
+		"degraded is failed": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "Degraded", "image pull failed")),
+			want: map[string]ObjectReport{"m": {State: StateFailed, Message: "image pull failed"}},
+		},
+		"progressing is pending": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "Progressing", "starting")),
+			want: map[string]ObjectReport{"m": {State: StatePending, Message: "starting"}},
+		},
+		// The live object is the previous revision.
+		"out of sync and healthy is pending": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Healthy", "")),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		"out of sync and degraded stays failed": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Degraded", "crash loop")),
+			want: map[string]ObjectReport{"m": {State: StateFailed, Message: "crash loop"}},
+		},
+		"missing is pending": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Missing", "")),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		"no health is pending": {
+			app:  application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "", "")),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		"out of sync after a failed sync is failed with the sync's message": {
+			app: withSyncFailure(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Missing", "")),
+				"one or more objects failed to apply"),
+			want: map[string]ObjectReport{"m": {State: StateFailed, Message: "one or more objects failed to apply"}},
+		},
+		// The failure was a sync to an older revision; the object changed since.
+		"an old failed sync doesn't fail an object edited since": {
+			app: withSyncFailureAt(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Healthy", "")),
+				"an older failure", "r1"),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		// While the models namespace moves, the old copy is OutOfSync and
+		// requiresPruning; the new one decides.
+		"a copy being pruned is left out": {
+			app: application(models, "site-a",
+				pruning(appResource(kindLLMInferenceService, "m", "OutOfSync", "Healthy", "")),
+				appResource(kindLLMInferenceService, "m", "Synced", "Healthy", "")),
+			want: map[string]ObjectReport{"m": {State: StateReady}},
+		},
+		"a repeated name keeps the worse report, in either order": {
+			app: application(models, "site-a",
+				appResource(kindLLMInferenceService, "m", "Synced", "Degraded", "old"),
+				appResource(kindLLMInferenceService, "m", "Synced", "Healthy", ""),
+				appResource(kindLLMInferenceService, "n", "Synced", "Healthy", ""),
+				appResource(kindLLMInferenceService, "n", "Synced", "Progressing", "")),
+			want: map[string]ObjectReport{"m": {State: StateFailed, Message: "old"}, "n": {State: StatePending}},
+		},
+		// An AppProject refusal: the resource is OutOfSync and Missing, the
+		// Application Healthy, and the reason only in operationState.
+		"a sync Argo CD is retrying is pending with its message": {
+			app: withRetry(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Missing", "")),
+				refusal, 2),
+			want: map[string]ObjectReport{"m": {State: StatePending, Message: refusal, Retrying: true}},
+		},
+		// Fixed in r3 while the retry of r2 still runs: the old reason goes.
+		"a retry of an older revision is plain pending": {
+			app: func() *unstructured.Unstructured {
+				app := withRetry(
+					application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Missing", "")),
+					refusal, 3)
+				_ = unstructured.SetNestedField(app.Object, "r3", "status", "sync", "revision")
+				return app
+			}(),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		"a first sync attempt still running is plain pending": {
+			app: withRetry(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "OutOfSync", "Missing", "")),
+				"syncing", 0),
+			want: map[string]ObjectReport{"m": {State: StatePending}},
+		},
+		"a retried sync leaves synced objects alone": {
+			app: withRetry(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "Healthy", "")),
+				refusal, 2),
+			want: map[string]ObjectReport{"m": {State: StateReady}},
+		},
+		"a failed sync leaves synced objects alone": {
+			app: withSyncFailure(
+				application(models, "site-a", appResource(kindLLMInferenceService, "m", "Synced", "Healthy", "")),
+				"another object failed"),
+			want: map[string]ObjectReport{"m": {State: StateReady}},
+		},
+		"other kinds are left out": {
+			app: application(models, "site-a",
+				appResource("NetworkPolicy", "m-grid", "Synced", "", ""),
+				appResource(kindLLMInferenceService, "m", "Synced", "Healthy", "")),
+			want: map[string]ObjectReport{"m": {State: StateReady}},
+		},
+		"an Application with no resources lists nothing": {
+			app:  application(models, "site-a"),
+			want: map[string]ObjectReport{},
+		},
 	} {
-		t.Run(tc.check, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			got, err := reader.Read(context.Background(), tc.policy, tc.check)
+			got, err := NewCatalogStatusReader(newAppClient(tc.app), CatalogApps{}).Read(context.Background(), ModelsSet, kindLLMInferenceService)
 			if err != nil {
 				t.Fatalf("Read() error = %v", err)
 			}
-			if !maps.EqualFunc(got, tc.want, func(a, b map[string]bool) bool { return (a == nil) == (b == nil) && maps.Equal(a, b) }) {
-				t.Fatalf("Read(%s, %s) = %v, want %v", tc.policy, tc.check, got, tc.want)
+			if want := (ObjectReports{"site-a": tc.want}); !reflect.DeepEqual(got, want) {
+				t.Fatalf("Read() = %v, want %v", got, want)
 			}
 		})
 	}
 }
 
-func TestCatalogStatusReadUnavailable(t *testing.T) {
+func TestCatalogStatusReadApplications(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	forbidden := apierrors.NewForbidden(policiesResource.GroupResource(), "x", errors.New("no access"))
-
-	t.Run("nil reader", func(t *testing.T) {
+	healthy := func(kind, name string) map[string]interface{} {
+		return appResource(kind, name, "Synced", "Healthy", "")
+	}
+	t.Run("each set's own Applications, by owner", func(t *testing.T) {
 		t.Parallel()
-		var r *CatalogStatusReader
-		if got, err := r.Read(ctx, "p", "c"); got != nil || err != nil {
-			t.Fatalf("Read() = %v, %v", got, err)
+		client := newAppClient(
+			application(DefaultCatalogModelsAppSet, "site-b", healthy(kindLLMInferenceService, "m")),
+			application(DefaultCatalogIngressAppSet, "site-a", healthy(kindMaaSModelRef, "m")),
+			// Named like site-x's models Application, but nobody's.
+			applicationNamed(DefaultCatalogModelsAppSet+"-site-x", "", healthy(kindLLMInferenceService, "m")),
+			// Owned by another ApplicationSet whose name extends the models set's.
+			application(DefaultCatalogModelsAppSet+"-extra", "site-y", healthy(kindLLMInferenceService, "m")),
+		)
+		reader := NewCatalogStatusReader(client, CatalogApps{})
+		got, err := reader.Read(ctx, ModelsSet, kindLLMInferenceService)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if want := (ObjectReports{"site-b": {"m": {State: StateReady}}}); !reflect.DeepEqual(got, want) {
+			t.Fatalf("models Read() = %v, want %v", got, want)
+		}
+		got, err = reader.Read(ctx, IngressSet, kindMaaSModelRef)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if want := (ObjectReports{"site-a": {"m": {State: StateReady}}}); !reflect.DeepEqual(got, want) {
+			t.Fatalf("ingress Read() = %v, want %v", got, want)
 		}
 	})
-	t.Run("root not found", func(t *testing.T) {
+	t.Run("configured names and namespace", func(t *testing.T) {
 		t.Parallel()
-		got, err := NewCatalogStatusReader(newPolicyClient(), "").Read(ctx, "ai-grid-models-status", "models-ready")
-		if got != nil || err != nil {
-			t.Fatalf("Read() = %v, %v; want no status", got, err)
+		app := application("my-subs", "edge", healthy(kindMaaSSubscription, "team-a"))
+		app.SetNamespace("argocd")
+		reader := NewCatalogStatusReader(newAppClient(app), CatalogApps{Namespace: "argocd", Subscriptions: "my-subs"})
+		got, err := reader.Read(ctx, SubscriptionsSet, kindMaaSSubscription)
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if want := (ObjectReports{"edge": {"team-a": {State: StateReady}}}); !reflect.DeepEqual(got, want) {
+			t.Fatalf("Read() = %v, want %v", got, want)
 		}
 	})
-	t.Run("root forbidden", func(t *testing.T) {
+	t.Run("a nil reader reports nothing", func(t *testing.T) {
 		t.Parallel()
-		client := newPolicyClient()
-		client.PrependReactor("get", "policies", func(clienttesting.Action) (bool, runtime.Object, error) {
-			return true, nil, forbidden
+		var reader *CatalogStatusReader
+		if got, err := reader.Read(ctx, ModelsSet, kindLLMInferenceService); got != nil || err != nil {
+			t.Fatalf("Read() = %v, %v; want nil, nil", got, err)
+		}
+	})
+	t.Run("a missing or forbidden list warns once", func(t *testing.T) {
+		t.Parallel()
+		client := newAppClient()
+		client.PrependReactor("list", "applications", func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewForbidden(applicationsResource.GroupResource(), "", errors.New("no access"))
 		})
-		got, err := NewCatalogStatusReader(client, "").Read(ctx, "ai-grid-models-status", "models-ready")
-		if got != nil || err != nil {
-			t.Fatalf("Read() = %v, %v; want no status", got, err)
+		var logs strings.Builder
+		reader := NewCatalogStatusReader(client, CatalogApps{}).SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+		for range 3 {
+			_, _ = reader.Read(ctx, ModelsSet, kindLLMInferenceService)
+		}
+		if n := strings.Count(logs.String(), "can't list the catalog's Argo CD Applications"); n != 1 {
+			t.Fatalf("warned %d times, want once:\n%s", n, logs.String())
 		}
 	})
-	t.Run("copy forbidden", func(t *testing.T) {
-		t.Parallel()
-		client := newPolicyClient(rootPolicy("ai-grid-models-status", "site-a"))
-		client.PrependReactor("get", "policies", func(action clienttesting.Action) (bool, runtime.Object, error) {
-			if action.GetNamespace() == "site-a" {
-				return true, nil, forbidden
+	for name, apiErr := range map[string]error{
+		"not found": apierrors.NewNotFound(applicationsResource.GroupResource(), ""),
+		"forbidden": apierrors.NewForbidden(applicationsResource.GroupResource(), "", errors.New("no access")),
+	} {
+		t.Run(name+" reports nothing", func(t *testing.T) {
+			t.Parallel()
+			client := newAppClient()
+			client.PrependReactor("list", "applications", func(clienttesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apiErr
+			})
+			if got, err := NewCatalogStatusReader(client, CatalogApps{}).Read(ctx, ModelsSet, kindLLMInferenceService); got != nil || err != nil {
+				t.Fatalf("Read() = %v, %v; want nil, nil", got, err)
 			}
-			return false, nil, nil
 		})
-		got, err := NewCatalogStatusReader(client, "").Read(ctx, "ai-grid-models-status", "models-ready")
-		if err != nil || len(got) != 1 || got["site-a"] != nil {
-			t.Fatalf("Read() = %v, %v; want site-a with no report", got, err)
-		}
-	})
-	t.Run("other error", func(t *testing.T) {
+	}
+	t.Run("other errors are returned", func(t *testing.T) {
 		t.Parallel()
-		client := newPolicyClient()
-		client.PrependReactor("get", "policies", func(clienttesting.Action) (bool, runtime.Object, error) {
+		client := newAppClient()
+		client.PrependReactor("list", "applications", func(clienttesting.Action) (bool, runtime.Object, error) {
 			return true, nil, apierrors.NewServiceUnavailable("down")
 		})
-		if _, err := NewCatalogStatusReader(client, "").Read(ctx, "ai-grid-models-status", "models-ready"); err == nil {
+		if _, err := NewCatalogStatusReader(client, CatalogApps{}).Read(ctx, ModelsSet, kindLLMInferenceService); err == nil {
 			t.Fatal("Read() error = nil, want the API error")
 		}
 	})
 }
 
-func newPolicyClient(objects ...runtime.Object) *fake.FakeDynamicClient {
-	return fake.NewSimpleDynamicClientWithCustomListKinds(
-		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{policiesResource: "PolicyList"},
-		objects...,
-	)
-}
-
-// rootPolicy is a root Policy in ai-grid-policies that lists clusters in
-// status.status, each in a namespace of its own name.
-func rootPolicy(name string, clusters ...string) *unstructured.Unstructured {
-	status := make([]interface{}, 0, len(clusters))
-	for _, cluster := range clusters {
-		status = append(status, map[string]interface{}{"clustername": cluster, "clusternamespace": cluster, "compliant": "NonCompliant"})
+func TestClusterSummary(t *testing.T) {
+	t.Parallel()
+	got := clusterSummary([]string{"site-c"}, []string{"site-a"}, []string{"site-b"}, []string{"edge"})
+	if want := "Failed on site-c; not ready on site-a; ready on site-b; no report from edge"; got != want {
+		t.Fatalf("clusterSummary() = %q, want %q", got, want)
 	}
-	return &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "policy.open-cluster-management.io/v1",
-		"kind":       "Policy",
-		"metadata":   map[string]interface{}{"name": name, "namespace": DefaultPolicyNamespace},
-		"status":     map[string]interface{}{"status": status},
-	}}
-}
-
-// clusterPolicy is a cluster's copy of a root Policy, with the latest message
-// of each ConfigurationPolicy, after an older one that must be ignored.
-func clusterPolicy(cluster, policy string, messages map[string]string) *unstructured.Unstructured {
-	details := []interface{}{}
-	for check, message := range messages {
-		details = append(details, map[string]interface{}{
-			"compliant":    "NonCompliant",
-			"templateMeta": map[string]interface{}{"name": check},
-			"history": []interface{}{
-				map[string]interface{}{"message": message, "eventName": "e2"},
-				map[string]interface{}{"message": msgTemplateFailure, "eventName": "e1"},
-			},
-		})
+	if got := clusterSummary(nil, nil, nil, nil); got != "" {
+		t.Fatalf("clusterSummary() = %q, want empty", got)
 	}
-	return &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "policy.open-cluster-management.io/v1",
-		"kind":       "Policy",
-		"metadata":   map[string]interface{}{"name": DefaultPolicyNamespace + "." + policy, "namespace": cluster},
-		"status":     map[string]interface{}{"details": details},
-	}}
 }

@@ -98,13 +98,18 @@ func main() {
 	}
 	// Models and Subscriptions are committed to the AI_GRID_GIT_URL
 	// repository, and Argo CD delivers them. The status of what came up on
-	// the spokes is read back from inform-only ACM Policies on this hub.
+	// the spokes is read back from the catalog's Argo CD Applications on this hub.
 	writer, err := newGitWriter()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "git writer: %v\n", err)
 		os.Exit(1)
 	}
-	status := servers.NewCatalogStatusReader(kubeClient, getEnv("AI_GRID_POLICY_NAMESPACE", servers.DefaultPolicyNamespace))
+	status := servers.NewCatalogStatusReader(kubeClient, servers.CatalogApps{
+		Namespace:     getEnv("AI_GRID_CATALOG_APP_NAMESPACE", servers.DefaultCatalogAppNamespace),
+		Models:        getEnv("AI_GRID_CATALOG_MODELS_APPSET", servers.DefaultCatalogModelsAppSet),
+		Ingress:       getEnv("AI_GRID_CATALOG_INGRESS_APPSET", servers.DefaultCatalogIngressAppSet),
+		Subscriptions: getEnv("AI_GRID_CATALOG_SUBSCRIPTIONS_APPSET", servers.DefaultCatalogSubscriptionsAppSet),
+	})
 	subscriptionNamespace := getEnv("AI_GRID_SUBSCRIPTION_NAMESPACE", "models-as-a-service")
 	modelsServer, err := servers.NewModelsServer().
 		SetWriter(writer).

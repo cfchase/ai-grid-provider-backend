@@ -252,19 +252,20 @@ func (s *ModelsServer) gitCommitModel(ctx context.Context, head gitops.Snapshot,
 	return written.model, nil
 }
 
-// modelReports is what the status Policies report about models: inference
-// holds each cluster's LLMInferenceServices (models-ready), ingress each
-// cluster's MaaSModelRefs (model-refs-ready). Both are named by model id.
+// modelReports is what the catalog's Applications report about models, all
+// named by model id: inference holds each cluster's LLMInferenceServices
+// (the models ApplicationSet), refs and externals each cluster's
+// MaaSModelRefs and ExternalModels (the ingress ApplicationSet).
 //
 // ingressClusters are the clusters the hub labels as ingress: ai-grid/enabled
 // "true" and ai-grid/role ingress or combined, the same labels
 // ListPlacementClusters reads for inference and combined. Each should report
-// the MaaSModelRef whether or not the catalog Policy lists it, so an ingress
-// cluster the Policy hasn't reached yet, or a Policy that can't be read,
-// doesn't count as ready.
+// the MaaSModelRef whether or not it has an ingress Application yet, so an
+// ingress cluster Argo CD hasn't reached, or Applications that can't be read,
+// don't count as ready.
 type modelReports struct {
-	inference, ingress ObjectReports
-	ingressClusters    []string
+	inference, refs, externals ObjectReports
+	ingressClusters            []string
 }
 
 func (s *ModelsServer) readModelReports(ctx context.Context) modelReports {
@@ -272,16 +273,17 @@ func (s *ModelsServer) readModelReports(ctx context.Context) modelReports {
 		return modelReports{}
 	}
 	return modelReports{
-		inference:       readReports(ctx, s.logger, s.status, modelsStatusPolicy, modelsReadyCheck),
-		ingress:         readReports(ctx, s.logger, s.status, catalogStatusPolicy, modelRefsReadyCheck),
+		inference:       readReports(ctx, s.logger, s.status, ModelsSet, kindLLMInferenceService),
+		refs:            readReports(ctx, s.logger, s.status, IngressSet, kindMaaSModelRef),
+		externals:       readReports(ctx, s.logger, s.status, IngressSet, kindExternalModel),
 		ingressClusters: s.ingressClusters(ctx),
 	}
 }
 
 // ingressClusters lists the clusters labelled ai-grid/enabled "true" and
 // ai-grid/role ingress or combined. Without a dynamic client, or when the
-// list fails (logged), it knows none, and only the catalog Policy's clusters
-// count as ingress.
+// list fails (logged), it knows none, and only the clusters with an ingress
+// Application count as ingress.
 func (s *ModelsServer) ingressClusters(ctx context.Context) []string {
 	if s.client == nil {
 		return nil
@@ -301,58 +303,77 @@ func (s *ModelsServer) ingressClusters(ctx context.Context) []string {
 	return names
 }
 
+// kindReport is one cluster's report about one of the model's objects.
+type kindReport struct {
+	kind   string
+	report ObjectReport
+	found  bool
+}
+
 // apply sets the model's status from the reports. Each cluster the file
 // places the model on should report its LLMInferenceService, and each ingress
-// cluster (the catalog Policy's, and r.ingressClusters) should report its
-// MaaSModelRef; a combined cluster reports both. Each cluster is ready when every report it
-// should send says ready, not ready when one says not ready (or not found),
-// and otherwise not reporting. status.message summarises every cluster, and
-// status.clusters holds each placed one (ModelClusterStatus). The model is
+// cluster (one with an ingress Application, or r.ingressClusters) its
+// MaaSModelRef and ExternalModel; a combined cluster reports all three. A
+// cluster is failed when one of its reports is failed (Degraded, or its sync
+// failed), not ready when one is pending, not reporting when one is missing,
+// and otherwise ready. status.message summarises every cluster and adds the
+// message of each failed object and each one whose sync Argo CD is retrying;
+// status.clusters holds each placed one (ModelClusterStatus). The model is,
+// in the console's order of precedence (ModelPhase in model_type.proto):
 // READY when every cluster is ready; PARTIALLY_AVAILABLE when every ingress
-// cluster reports the MaaSModelRef ready and some, not all, placed clusters
-// are ready; otherwise PENDING (reason NotReady). Both need at least one
-// ingress cluster: with none, nothing shows the model published, so it is
-// PENDING and the message says so. That is the console's
-// precedence (ModelPhase in model_type.proto). With no report at all it stays
-// saved to Git, with no clusters. It is never FAILED: the Policies can't tell
-// a failed model from one that is still starting.
+// cluster is ready and some, not all, placed clusters are; FAILED when any
+// cluster is failed; otherwise PENDING (reason NotReady). All but FAILED need
+// at least one ingress cluster: with none, nothing shows the model published,
+// so it is PENDING and the message says so. With no report at all it stays
+// saved to Git, with no clusters.
 func (r modelReports) apply(current *gitModel) {
 	id := current.model.GetId()
 	placed := current.clusters
 	clusters := slices.Clone(placed)
-	for cluster := range r.ingress {
+	for cluster := range r.refs {
 		clusters = append(clusters, cluster)
 	}
 	clusters = append(clusters, r.ingressClusters...)
 	slices.Sort(clusters)
 	clusters = slices.Compact(clusters)
 
-	var ready, notReady, noReport []string
+	var ready, notReady, failed, noReport, failures []string
 	var placedStatus []*aigridv1.ModelClusterStatus
 	placedReady, ingressReady, anyIngress := 0, true, false
 	reported := false
 	for _, cluster := range clusters {
 		isPlaced := slices.Contains(placed, cluster)
-		inference, hasInference := r.inference[cluster][id]
-		ingress, hasIngress := r.ingress[cluster][id]
-		_, isIngress := r.ingress[cluster]
+		_, isIngress := r.refs[cluster]
 		isIngress = isIngress || slices.Contains(r.ingressClusters, cluster)
 		anyIngress = anyIngress || isIngress
-		hasInference = hasInference && isPlaced
-		reported = reported || hasInference || hasIngress
-		var state string
-		switch {
-		case (hasInference && !inference) || (hasIngress && !ingress):
-			notReady = append(notReady, cluster)
-			state = "NotReady"
-		case (isPlaced && !hasInference) || (isIngress && !hasIngress):
-			noReport = append(noReport, cluster)
-			state = "NoReport"
-		case hasInference || hasIngress:
-			ready = append(ready, cluster)
-			state = "Ready"
+		var reports []kindReport
+		expect := func(objects ObjectReports, kind string) {
+			report, found := objects[cluster][id]
+			reports = append(reports, kindReport{kind: kind, report: report, found: found})
+			reported = reported || found
+			if found && (report.State == StateFailed || report.Retrying) && report.Message != "" {
+				failures = append(failures, fmt.Sprintf("%s on %s: %s", kind, cluster, report.Message))
+			}
 		}
-		if isIngress && (!hasIngress || !ingress) {
+		if isPlaced {
+			expect(r.inference, kindLLMInferenceService)
+		}
+		if isIngress {
+			expect(r.refs, kindMaaSModelRef)
+			expect(r.externals, kindExternalModel)
+		}
+		state := clusterState(reports)
+		switch state {
+		case "Failed":
+			failed = append(failed, cluster)
+		case "NotReady":
+			notReady = append(notReady, cluster)
+		case "NoReport":
+			noReport = append(noReport, cluster)
+		default:
+			ready = append(ready, cluster)
+		}
+		if isIngress && !ingressObjectsReady(reports) {
 			ingressReady = false
 		}
 		if !isPlaced {
@@ -362,11 +383,14 @@ func (r modelReports) apply(current *gitModel) {
 			Cluster: cluster,
 			Phase:   aigridv1.ModelPhase_MODEL_PHASE_PENDING,
 			Reason:  state,
-			Message: clusterReports(hasInference, inference, isIngress, hasIngress, ingress),
+			Message: clusterReports(reports),
 		}
-		if state == "Ready" {
+		switch state {
+		case "Ready":
 			entry.Phase = aigridv1.ModelPhase_MODEL_PHASE_READY
 			placedReady++
+		case "Failed":
+			entry.Phase = aigridv1.ModelPhase_MODEL_PHASE_FAILED
 		}
 		placedStatus = append(placedStatus, entry)
 	}
@@ -374,44 +398,79 @@ func (r modelReports) apply(current *gitModel) {
 		return
 	}
 	status := current.model.Status
-	status.Message = clusterSummary(notReady, ready, noReport)
+	status.Message = clusterSummary(failed, notReady, ready, noReport)
 	if !anyIngress {
 		status.Message += "; no ingress cluster has reported the MaaSModelRef"
 	}
+	if len(failures) > 0 {
+		status.Message += ". " + strings.Join(failures, "; ")
+	}
 	status.Clusters = placedStatus
 	switch {
-	case !anyIngress:
-		status.Phase = aigridv1.ModelPhase_MODEL_PHASE_PENDING
-		status.Reason = "NotReady"
-	case len(notReady) == 0 && len(noReport) == 0:
+	case anyIngress && len(failed) == 0 && len(notReady) == 0 && len(noReport) == 0:
 		status.Phase = aigridv1.ModelPhase_MODEL_PHASE_READY
 		status.Reason = "Ready"
-	case ingressReady && placedReady > 0 && placedReady < len(placedStatus):
+	case anyIngress && ingressReady && placedReady > 0 && placedReady < len(placedStatus):
 		status.Phase = aigridv1.ModelPhase_MODEL_PHASE_PARTIALLY_AVAILABLE
 		status.Reason = "PartiallyAvailable"
+	case len(failed) > 0:
+		status.Phase = aigridv1.ModelPhase_MODEL_PHASE_FAILED
+		status.Reason = "Failed"
 	default:
 		status.Phase = aigridv1.ModelPhase_MODEL_PHASE_PENDING
 		status.Reason = "NotReady"
 	}
 }
 
-// clusterReports says what one placed cluster reported about the model, for
-// example "LLMInferenceService ready; MaaSModelRef not ready" on a combined
-// cluster. "Not ready" covers the Policies' "not found" as well (ObjectReports).
-func clusterReports(hasInference, inference, isIngress, hasIngress, ingress bool) string {
-	report := func(kind string, has, ready bool) string {
+// clusterState is what a cluster's reports add up to: Failed when one is
+// failed, NotReady when one is pending, NoReport when one is missing, and
+// Ready otherwise.
+func clusterState(reports []kindReport) string {
+	state := "Ready"
+	for _, r := range reports {
 		switch {
-		case !has:
-			return "no " + kind + " report"
-		case ready:
-			return kind + " ready"
-		default:
-			return kind + " not ready"
+		case r.found && r.report.State == StateFailed:
+			return "Failed"
+		case r.found && r.report.State == StatePending:
+			state = "NotReady"
+		case !r.found && state == "Ready":
+			state = "NoReport"
 		}
 	}
-	message := report("LLMInferenceService", hasInference, inference)
-	if isIngress {
-		message += "; " + report("MaaSModelRef", hasIngress, ingress)
+	return state
+}
+
+// ingressObjectsReady reports whether a cluster's MaaSModelRef and
+// ExternalModel reports both say ready.
+func ingressObjectsReady(reports []kindReport) bool {
+	for _, r := range reports {
+		if r.kind != kindLLMInferenceService && (!r.found || r.report.State != StateReady) {
+			return false
+		}
+	}
+	return true
+}
+
+// clusterReports says what one cluster reported about the model, for example
+// "LLMInferenceService ready; MaaSModelRef not ready; ExternalModel ready" on
+// a combined cluster.
+func clusterReports(reports []kindReport) string {
+	parts := make([]string, 0, len(reports))
+	for _, r := range reports {
+		switch {
+		case !r.found:
+			parts = append(parts, "no "+r.kind+" report")
+		case r.report.State == StateReady:
+			parts = append(parts, r.kind+" ready")
+		case r.report.State == StateFailed:
+			parts = append(parts, r.kind+" failed")
+		default:
+			parts = append(parts, r.kind+" not ready")
+		}
+	}
+	message := strings.Join(parts, "; ")
+	if message == "" {
+		return ""
 	}
 	return strings.ToUpper(message[:1]) + message[1:]
 }

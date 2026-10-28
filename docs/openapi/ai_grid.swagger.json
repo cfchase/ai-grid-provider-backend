@@ -1632,18 +1632,18 @@
         },
         "phase": {
           "$ref": "#/definitions/v1ModelPhase",
-          "description": "READY when every report from the cluster says ready; PENDING when one\nsays not ready (or not found) or one is missing. Git mode never sets\nFAILED; PARTIALLY_AVAILABLE is only a whole model's phase."
+          "description": "READY when every report from the cluster says ready; FAILED when one\nsays failed; PENDING when one says not ready or one is missing.\nPARTIALLY_AVAILABLE is only a whole model's phase."
         },
         "reason": {
           "type": "string",
-          "description": "Ready, NotReady (a report says not ready or not found) or NoReport (the\ncluster hasn't reported the object yet)."
+          "description": "Ready, Failed, NotReady (a report says not ready) or NoReport (the\ncluster hasn't reported the object yet)."
         },
         "message": {
           "type": "string",
-          "description": "What the cluster reported, for example \"LLMInferenceService not ready\"\nor \"LLMInferenceService ready; no MaaSModelRef report\"."
+          "description": "What the cluster reported, for example \"LLMInferenceService not ready\"\nor \"LLMInferenceService ready; no MaaSModelRef report; no ExternalModel\nreport\"."
         }
       },
-      "description": "The model on one placed cluster. In git mode it comes from the hub's\nstatus Policies: the cluster's models-ready report of the model's\nLLMInferenceService (Ready=True), and, on a combined cluster, which is\nalso an ingress cluster, its model-refs-ready report of the model's\nMaaSModelRef (phase Ready). Output only.",
+      "description": "The model on one placed cluster. In git mode it comes from the health the\nhub's catalog Argo CD Applications record for the cluster's\nLLMInferenceService and, on a combined cluster, which is also an ingress\ncluster, for its MaaSModelRef and ExternalModel. Output only.",
       "readOnly": true
     },
     "v1ModelContainer": {
@@ -1768,7 +1768,7 @@
         "MODEL_PHASE_PARTIALLY_AVAILABLE"
       ],
       "default": "MODEL_PHASE_UNSPECIFIED",
-      "description": "Derived model phase.\n\nIn git mode, while no cluster has reported the model, the phase is\nUNSPECIFIED with reason SavedToGit. Once one has, the phase is, in this\norder of precedence:\n\n  - READY (reason Ready): every ingress cluster reports the model's\n    MaaSModelRef ready, and every placed cluster is READY in `clusters`.\n  - PARTIALLY_AVAILABLE (reason PartiallyAvailable): every ingress cluster\n    reports the MaaSModelRef ready, at least one placed cluster is READY\n    and at least one is not.\n  - PENDING (reason NotReady): otherwise, including while an ingress\n    cluster reports the MaaSModelRef not ready or hasn't reported it.\n\nThe ingress clusters are those the catalog status Policy lists and those\nlabelled ai-grid/enabled \"true\" and ai-grid/role ingress or combined; each\nmust report. READY and PARTIALLY_AVAILABLE need at least one: with none,\nnothing shows the model published, so it is PENDING, and the message ends\n\"no ingress cluster has reported the MaaSModelRef\".\n\nGit mode never reports FAILED: the status Policies can't tell a model\nthat failed from one that is still starting. The order is the one the\nconsole's Models page uses (READY, PARTIALLY_AVAILABLE, FAILED, then the\nPENDING cases; proposal P13).\n\n - MODEL_PHASE_PARTIALLY_AVAILABLE: Serving on some of the clusters its placement names but not all (see\nabove). Only a whole model has it; a cluster in ModelStatus.clusters is\nREADY or PENDING."
+      "description": "Derived model phase.\n\nIn git mode, while no cluster has reported the model, the phase is\nUNSPECIFIED with reason SavedToGit. Once one has, the phase is, in this\norder of precedence:\n\n  - READY (reason Ready): every ingress cluster reports the model's\n    MaaSModelRef and ExternalModel ready, and every placed cluster is\n    READY in `clusters`.\n  - PARTIALLY_AVAILABLE (reason PartiallyAvailable): every ingress cluster\n    reports them ready, at least one placed cluster is READY and at least\n    one is not.\n  - FAILED (reason Failed): a cluster reports one of the model's objects\n    failed: Argo CD health Degraded, or its sync failed.\n  - PENDING (reason NotReady): otherwise, including while an ingress\n    cluster reports the MaaSModelRef not ready or hasn't reported it.\n\nThe ingress clusters are those with a catalog ingress Application and those\nlabelled ai-grid/enabled \"true\" and ai-grid/role ingress or combined; each\nmust report. READY and PARTIALLY_AVAILABLE need at least one: with none,\nnothing shows the model published, so it is PENDING, and the message ends\n\"no ingress cluster has reported the MaaSModelRef\".\n\nThe order is the one the console's Models page uses (READY, PARTIALLY_AVAILABLE, FAILED, then the\nPENDING cases; proposal P13).\n\n - MODEL_PHASE_PARTIALLY_AVAILABLE: Serving on some of the clusters its placement names but not all (see\nabove). Only a whole model has it; a cluster in ModelStatus.clusters is\nREADY, FAILED or PENDING."
     },
     "v1ModelPlacement": {
       "type": "object",
@@ -2079,7 +2079,7 @@
             "type": "object",
             "$ref": "#/definitions/v1ModelClusterStatus"
           },
-          "description": "The model on each cluster its placement names (the clusters in\nplacement.selected_clusters), one entry per cluster in cluster-name\norder, from what the hub's status Policies report. Empty while no\ncluster has reported (reason SavedToGit). Ingress clusters the model\nisn't placed on, which publish it but don't run it, have no entry; their\nreports count in `phase` and `message`. Output only.",
+          "description": "The model on each cluster its placement names (the clusters in\nplacement.selected_clusters), one entry per cluster in cluster-name\norder, from what the hub's catalog Argo CD Applications report. Empty while no\ncluster has reported (reason SavedToGit). Ingress clusters the model\nisn't placed on, which publish it but don't run it, have no entry; their\nreports count in `phase` and `message`. Output only.",
           "readOnly": true
         }
       },

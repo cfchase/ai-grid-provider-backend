@@ -43,20 +43,22 @@ const (
 
 // Hub is the fake hub API server. It is safe for concurrent use.
 type Hub struct {
-	mu          sync.Mutex
-	clusters    map[string]*ManagedCluster
-	maas        map[string]map[string]*unstructured.Unstructured // resource -> ns/name -> object
-	policies    map[string]*unstructured.Unstructured            // ns/name -> fixture Policy
-	rv          int64
-	scenarios   []*scenario
-	detaches    map[string]time.Time
-	enabledAt   map[string]time.Time
-	access      Access
-	speed       float64
-	detachAfter time.Duration
-	start       time.Time
-	clock       func() time.Time
-	logger      *slog.Logger
+	mu       sync.Mutex
+	clusters map[string]*ManagedCluster
+	maas     map[string]map[string]*unstructured.Unstructured // resource -> ns/name -> object
+	policies map[string]*unstructured.Unstructured            // ns/name -> fixture Policy
+	// applications are the fixture Argo CD Applications, by namespace and name.
+	applications map[string]map[string]*unstructured.Unstructured
+	rv           int64
+	scenarios    []*scenario
+	detaches     map[string]time.Time
+	enabledAt    map[string]time.Time
+	access       Access
+	speed        float64
+	detachAfter  time.Duration
+	start        time.Time
+	clock        func() time.Time
+	logger       *slog.Logger
 	// nodes are what the fake Search indexes (search.go).
 	nodes []SearchNode
 }
@@ -76,16 +78,17 @@ func WithLogger(logger *slog.Logger) Option { return func(h *Hub) { h.logger = l
 // counter continues from the highest fixture resourceVersion.
 func New(fx *Fixtures, opts ...Option) (*Hub, error) {
 	h := &Hub{
-		clusters:    map[string]*ManagedCluster{},
-		maas:        map[string]map[string]*unstructured.Unstructured{},
-		policies:    map[string]*unstructured.Unstructured{},
-		detaches:    map[string]time.Time{},
-		enabledAt:   map[string]time.Time{},
-		access:      fx.Access,
-		speed:       1,
-		detachAfter: DefaultDetachAfter,
-		clock:       time.Now,
-		logger:      slog.Default(),
+		clusters:     map[string]*ManagedCluster{},
+		maas:         map[string]map[string]*unstructured.Unstructured{},
+		policies:     map[string]*unstructured.Unstructured{},
+		applications: map[string]map[string]*unstructured.Unstructured{},
+		detaches:     map[string]time.Time{},
+		enabledAt:    map[string]time.Time{},
+		access:       fx.Access,
+		speed:        1,
+		detachAfter:  DefaultDetachAfter,
+		clock:        time.Now,
+		logger:       slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -141,6 +144,9 @@ func New(fx *Fixtures, opts ...Option) (*Hub, error) {
 	if err := seedMAASFixtures(h, fx); err != nil {
 		return nil, err
 	}
+	if err := seedApplicationFixtures(h, fx); err != nil {
+		return nil, err
+	}
 	if err := seedPolicyFixtures(h, fx); err != nil {
 		return nil, err
 	}
@@ -163,6 +169,8 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("PATCH "+managedClustersPath+"/{name}", h.patch)
 	mux.HandleFunc("DELETE "+managedClustersPath+"/{name}", h.delete)
 	mux.HandleFunc("GET "+policiesPath+"/{namespace}/policies/{name}", h.getPolicy)
+	mux.HandleFunc("GET "+applicationsPath+"/{namespace}/applications", h.listApplications)
+	mux.HandleFunc("GET "+applicationsPath+"/{namespace}/applications/{name}", h.getApplication)
 	h.registerMAAS(mux)
 	h.registerModels(mux)
 	mux.HandleFunc("POST "+SearchPath, h.search)

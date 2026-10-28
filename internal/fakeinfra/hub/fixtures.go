@@ -25,6 +25,7 @@ const (
 	MaaSModelRefsFile        = "maasmodelrefs.json"
 	LLMInferenceServicesFile = "llminferenceservices.json"
 	PoliciesFile             = "policies.json"
+	ApplicationsFile         = "applications.json"
 	SearchNodesFile          = "searchnodes.json"
 )
 
@@ -57,11 +58,13 @@ type Fixtures struct {
 	MaaSModelRefs     []unstructured.Unstructured
 	// LLMInferenceService CRs for Models (optional; missing means empty List).
 	LLMInferenceServices []unstructured.Unstructured
-	// Policies are ACM Policies the hub serves by namespace and name, such as
-	// the status Policies the backend reads models' and subscriptions' status
-	// from and their per-cluster copies (optional). The ai-grid-ready Policy
-	// is computed from the clusters instead (policy.go).
+	// Policies are ACM Policies the hub serves as is by namespace and name
+	// (optional). The ai-grid-ready Policy is computed from the clusters
+	// instead (policy.go).
 	Policies []unstructured.Unstructured
+	// Applications are Argo CD Applications the hub serves by namespace: the
+	// catalog's, whose status.resources[] the backend reads status from.
+	Applications []unstructured.Unstructured
 	// SearchNodes are the nodes the fake ACM Search indexes (search.go).
 	SearchNodes []SearchNode
 }
@@ -187,6 +190,11 @@ func LoadFixtures(dir string) (*Fixtures, error) {
 		return nil, err
 	} else {
 		fx.Policies = items
+	}
+	if items, err := loadUnstructuredList(filepath.Join(dir, ApplicationsFile), applicationAPIVersion, applicationKind); err != nil {
+		return nil, err
+	} else {
+		fx.Applications = items
 	}
 	var nodes struct {
 		Comment string       `json:"_comment,omitempty"`

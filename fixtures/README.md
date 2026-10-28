@@ -73,7 +73,8 @@ them through the real Kubernetes and Keycloak clients.
 | `maasauthpolicies.json` | fake hub | A `MaaSAuthPolicyList` paired with the seeded subscriptions (`<id>-policy`). Optional. | hand-authored |
 | `maasmodelrefs.json` | fake hub | A `MaaSModelRefList` (often in namespace `llm`) for Get enrichment / model registrations; also pairs Models fixtures in `ai-grid-internal-models`. Optional. | hand-authored |
 | `llminferenceservices.json` | fake hub | An `LLMInferenceServiceList` (`serving.kserve.io/v1alpha2`) in `ai-grid-internal-models` for Models List/Get. Optional; missing means empty Models List until Create. | hand-authored |
-| `policies.json` | fake hub | A `PolicyList` (`policy.open-cluster-management.io/v1`) of ACM Policies served as is by namespace and name: the status Policies `ai-grid-models-status` and `ai-grid-catalog-status` in `ai-grid-policies` and each cluster's copy, which the backend reads the status of models, subscriptions and their auth policies from. Optional; missing means no reports, so everything shows Saved to Git. `default/` reports `granite-3b` ready on `site-paris-1`, not ready on `site-madrid-1` and its MaaSModelRef ready on `site-ashburn-1`, so placed on the first two it is partially available (P13); `poc/` is the same file with `site1`, `site2` and `site3`. The `ai-grid-ready` Policy is computed from the clusters instead and must not be listed. | hand-authored |
+| `policies.json` | fake hub | A `PolicyList` (`policy.open-cluster-management.io/v1`) of ACM Policies served as is by namespace and name. Optional; no preset ships one. The `ai-grid-ready` Policy is computed from the clusters instead and must not be listed. | hand-authored |
+| `applications.json` | fake hub | An `ApplicationList` (`argoproj.io/v1alpha1`) of Argo CD Applications served by namespace: the catalog's Applications in `openshift-gitops` (`<ApplicationSet>-<cluster>`, owned by the ApplicationSet), whose `status.resources[]` health the backend reads models' and subscriptions' status from. Optional; missing means no reports, so everything shows Saved to Git. `default/` reports `granite-3b` ready on `site-paris-1`, progressing on `site-madrid-1` and its MaaSModelRef ready on `site-ashburn-1`, so placed on the first two it is partially available (P13); `poc/` is the same file with `site1`, `site2` and `site3`. | hand-authored |
 | `searchnodes.json` | fake ACM Search (on the fake hub's port) | `{"items": [{cluster, name, labels, ready}]}`: the nodes Search indexes, with NVIDIA GPU Feature Discovery's labels as an ACM hub's spokes carry them. Each cluster's GPUs add up to its `status.capacity["nvidia.com/gpu"]`. **Hand-written, not converted**: the console has no node fixtures, so `hack/convert-console-fixtures` doesn't touch this file. | (none) |
 
 The backend no longer reads `maassubscriptions.json`, `maasauthpolicies.json`,
@@ -114,7 +115,7 @@ model (`fixture-cpu-llm`) whose shape matches Models Create; Subscriptions use
 the MaaS CR fixtures above instead of the console's flat `subscriptions.json`.
 
 `fixtures/poc` includes the same hand-authored MaaS / LLMInferenceService files, and
-the same status Policies on its own sites (`policies.json`), as
+the same catalog Applications on its own sites (`applications.json`), as
 `default/` (copied, not console-converted) so `make dev-fake-poc` can exercise
 Models and Subscriptions against the PoC cluster set.
 

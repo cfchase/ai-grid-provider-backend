@@ -13,33 +13,31 @@ import (
 
 var testPoliciesGVR = schema.GroupVersionResource{Group: "policy.open-cluster-management.io", Version: "v1", Resource: "policies"}
 
-// The shipped status Policies load, and the hub serves the roots and the
-// per-cluster copies by namespace and name.
-func TestShippedStatusPolicies(t *testing.T) {
+// A fixture Policy is served as is by namespace and name.
+func TestFixturePolicies(t *testing.T) {
 	t.Parallel()
 	fx := loadShipped(t, "default")
 	fx.Access.ServiceAccount.Token = testToken
+	fixture := unstructured.Unstructured{}
+	fixture.SetAPIVersion("policy.open-cluster-management.io/v1")
+	fixture.SetKind("Policy")
+	fixture.SetNamespace("site-paris-1")
+	fixture.SetName("ai-grid-policies.example")
+	fx.Policies = []unstructured.Unstructured{fixture}
 	th := startHub(t, fx)
 	client, err := dynamic.NewForConfig(&rest.Config{Host: th.srv.URL, BearerToken: testToken})
 	if err != nil {
 		t.Fatalf("dynamic.NewForConfig: %v", err)
 	}
-	for _, ref := range []struct{ namespace, name string }{
-		{"ai-grid-policies", "ai-grid-models-status"},
-		{"ai-grid-policies", "ai-grid-catalog-status"},
-		{"site-paris-1", "ai-grid-policies.ai-grid-models-status"},
-		{"site-ashburn-1", "ai-grid-policies.ai-grid-catalog-status"},
-	} {
-		got, err := client.Resource(testPoliciesGVR).Namespace(ref.namespace).Get(context.Background(), ref.name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("Get(%s/%s) error = %v", ref.namespace, ref.name, err)
-		}
-		if got.GetName() != ref.name || got.GetResourceVersion() == "" {
-			t.Fatalf("Get(%s/%s) = %s, resourceVersion %q", ref.namespace, ref.name, got.GetName(), got.GetResourceVersion())
-		}
+	got, err := client.Resource(testPoliciesGVR).Namespace("site-paris-1").Get(context.Background(), "ai-grid-policies.example", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
 	}
-	if _, err := client.Resource(testPoliciesGVR).Namespace("site-oslo-1").Get(context.Background(), "ai-grid-policies.ai-grid-models-status", metav1.GetOptions{}); err == nil {
-		t.Fatal("Get(a copy the fixtures don't have) succeeded")
+	if got.GetResourceVersion() == "" {
+		t.Fatal("Get() has no resourceVersion")
+	}
+	if _, err := client.Resource(testPoliciesGVR).Namespace("site-oslo-1").Get(context.Background(), "ai-grid-policies.example", metav1.GetOptions{}); err == nil {
+		t.Fatal("Get(a Policy the fixtures don't have) succeeded")
 	}
 }
 

@@ -1,0 +1,264 @@
+{
+  "_comment": "Argo CD Applications the fake hub serves by namespace (internal/fakeinfra/hub/applications.go): the catalog's Applications in openshift-gitops, one per cluster and ApplicationSet, whose status.resources[] the backend reads models' and subscriptions' status from (README, \"Status from the spokes\"). Static: model granite-3b is ready on site-paris-1 and progressing on site-madrid-1, with its MaaSModelRef and ExternalModel ready on site-ashburn-1; model granite-broken is degraded on site-madrid-1; subscription team-a and its auth policy team-a-policy are active on site-ashburn-1. A model or subscription with those names shows status in make dev-fake; any other name shows Saved to Git.",
+  "apiVersion": "argoproj.io/v1alpha1",
+  "kind": "ApplicationList",
+  "metadata": {},
+  "items": [
+    {
+      "apiVersion": "argoproj.io/v1alpha1",
+      "kind": "Application",
+      "metadata": {
+        "name": "acm-models-catalog-models-site-paris-1",
+        "namespace": "openshift-gitops",
+        "ownerReferences": [
+          {
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "ApplicationSet",
+            "name": "acm-models-catalog-models",
+            "uid": "fixture-acm-models-catalog-models",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "project": "acm-models-catalog-models",
+        "destination": {
+          "name": "site-paris-1",
+          "namespace": "ai-grid-internal-models"
+        }
+      },
+      "status": {
+        "sync": {
+          "status": "Synced"
+        },
+        "health": {
+          "status": "Healthy"
+        },
+        "operationState": {
+          "phase": "Succeeded"
+        },
+        "resources": [
+          {
+            "group": "networking.k8s.io",
+            "version": "v1",
+            "kind": "NetworkPolicy",
+            "name": "granite-3b-grid",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced"
+          },
+          {
+            "group": "serving.kserve.io",
+            "version": "v1alpha2",
+            "kind": "LLMInferenceService",
+            "name": "granite-3b",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced",
+            "health": {
+              "status": "Healthy",
+              "message": "LLMInferenceService is ready"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "argoproj.io/v1alpha1",
+      "kind": "Application",
+      "metadata": {
+        "name": "acm-models-catalog-models-site-madrid-1",
+        "namespace": "openshift-gitops",
+        "ownerReferences": [
+          {
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "ApplicationSet",
+            "name": "acm-models-catalog-models",
+            "uid": "fixture-acm-models-catalog-models",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "project": "acm-models-catalog-models",
+        "destination": {
+          "name": "site-madrid-1",
+          "namespace": "ai-grid-internal-models"
+        }
+      },
+      "status": {
+        "sync": {
+          "status": "Synced"
+        },
+        "health": {
+          "status": "Healthy"
+        },
+        "operationState": {
+          "phase": "Succeeded"
+        },
+        "resources": [
+          {
+            "group": "networking.k8s.io",
+            "version": "v1",
+            "kind": "NetworkPolicy",
+            "name": "granite-3b-grid",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced"
+          },
+          {
+            "group": "serving.kserve.io",
+            "version": "v1alpha2",
+            "kind": "LLMInferenceService",
+            "name": "granite-3b",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced",
+            "health": {
+              "status": "Progressing",
+              "message": "Waiting for the main workload"
+            }
+          },
+          {
+            "group": "networking.k8s.io",
+            "version": "v1",
+            "kind": "NetworkPolicy",
+            "name": "granite-broken-grid",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced"
+          },
+          {
+            "group": "serving.kserve.io",
+            "version": "v1alpha2",
+            "kind": "LLMInferenceService",
+            "name": "granite-broken",
+            "namespace": "ai-grid-internal-models",
+            "status": "Synced",
+            "health": {
+              "status": "Degraded",
+              "message": "Deployment does not have minimum availability."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "argoproj.io/v1alpha1",
+      "kind": "Application",
+      "metadata": {
+        "name": "acm-models-catalog-ingress-site-ashburn-1",
+        "namespace": "openshift-gitops",
+        "ownerReferences": [
+          {
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "ApplicationSet",
+            "name": "acm-models-catalog-ingress",
+            "uid": "fixture-acm-models-catalog-ingress",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "project": "acm-models-catalog-ingress",
+        "destination": {
+          "name": "site-ashburn-1",
+          "namespace": "models-as-a-service"
+        }
+      },
+      "status": {
+        "sync": {
+          "status": "Synced"
+        },
+        "health": {
+          "status": "Healthy"
+        },
+        "operationState": {
+          "phase": "Succeeded"
+        },
+        "resources": [
+          {
+            "group": "inference.opendatahub.io",
+            "version": "v1alpha1",
+            "kind": "ExternalModel",
+            "name": "granite-3b",
+            "namespace": "models-as-a-service",
+            "status": "Synced",
+            "health": {
+              "status": "Healthy",
+              "message": "ExternalModel is ready"
+            }
+          },
+          {
+            "group": "maas.opendatahub.io",
+            "version": "v1alpha1",
+            "kind": "MaaSModelRef",
+            "name": "granite-3b",
+            "namespace": "models-as-a-service",
+            "status": "Synced",
+            "health": {
+              "status": "Healthy",
+              "message": "Governed and runtime-healthy"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "argoproj.io/v1alpha1",
+      "kind": "Application",
+      "metadata": {
+        "name": "acm-models-catalog-subscriptions-site-ashburn-1",
+        "namespace": "openshift-gitops",
+        "ownerReferences": [
+          {
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "ApplicationSet",
+            "name": "acm-models-catalog-subscriptions",
+            "uid": "fixture-acm-models-catalog-subscriptions",
+            "controller": true
+          }
+        ]
+      },
+      "spec": {
+        "project": "acm-models-catalog-subscriptions",
+        "destination": {
+          "name": "site-ashburn-1",
+          "namespace": "models-as-a-service"
+        }
+      },
+      "status": {
+        "sync": {
+          "status": "Synced"
+        },
+        "health": {
+          "status": "Healthy"
+        },
+        "operationState": {
+          "phase": "Succeeded"
+        },
+        "resources": [
+          {
+            "group": "maas.opendatahub.io",
+            "version": "v1alpha1",
+            "kind": "MaaSAuthPolicy",
+            "name": "team-a-policy",
+            "namespace": "models-as-a-service",
+            "status": "Synced",
+            "health": {
+              "status": "Healthy",
+              "message": "successfully reconciled"
+            }
+          },
+          {
+            "group": "maas.opendatahub.io",
+            "version": "v1alpha1",
+            "kind": "MaaSSubscription",
+            "name": "team-a",
+            "namespace": "models-as-a-service",
+            "status": "Synced",
+            "health": {
+              "status": "Healthy",
+              "message": "successfully reconciled"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

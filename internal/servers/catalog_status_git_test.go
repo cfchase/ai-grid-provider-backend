@@ -2,11 +2,8 @@ package servers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"slices"
 	"testing"
 
@@ -17,31 +14,47 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
 	clienttesting "k8s.io/client-go/testing"
 )
 
-// statusMessage is a ConfigurationPolicy message about one object.
-func statusMessage(plural, name, namespace string, ready bool) string {
-	if ready {
-		return plural + " [" + name + "] found as specified in namespace " + namespace
-	}
-	return plural + " [" + name + "] found but not as specified in namespace " + namespace
+// llmisvc, modelRef and externalModel are a catalog resource for model
+// granite in the given sync and health.
+func llmisvc(sync, health, message string) map[string]interface{} {
+	return appResource(kindLLMInferenceService, "granite", sync, health, message)
 }
 
-func modelReady(ready bool) map[string]string {
-	return map[string]string{modelsReadyCheck: statusMessage("llminferenceservices", "granite", "ai-grid-internal-models", ready)}
+func modelRef(sync, health string) map[string]interface{} {
+	return appResource(kindMaaSModelRef, "granite", sync, health, "")
 }
 
-func modelRefReady(ready bool) map[string]string {
-	return map[string]string{modelRefsReadyCheck: statusMessage("maasmodelrefs", "granite", "models-as-a-service", ready)}
+func externalModel(sync, health string) map[string]interface{} {
+	return appResource(kindExternalModel, "granite", sync, health, "")
 }
 
-// forbidPolicies makes every Policy get Forbidden.
-func forbidPolicies(client *fake.FakeDynamicClient) {
-	client.PrependReactor("get", "policies", func(clienttesting.Action) (bool, runtime.Object, error) {
-		return true, nil, apierrors.NewForbidden(policiesResource.GroupResource(), "x", errors.New("no access"))
+// modelsApp, ingressApp and subscriptionsApp are a cluster's catalog
+// Applications.
+func modelsApp(cluster string, resources ...map[string]interface{}) runtime.Object {
+	return application(DefaultCatalogModelsAppSet, cluster, resources...)
+}
+
+func ingressApp(cluster string, resources ...map[string]interface{}) runtime.Object {
+	return application(DefaultCatalogIngressAppSet, cluster, resources...)
+}
+
+func subscriptionsApp(cluster string, resources ...map[string]interface{}) runtime.Object {
+	return application(DefaultCatalogSubscriptionsAppSet, cluster, resources...)
+}
+
+// readyIngress is an ingress Application that reports granite published.
+func readyIngress(cluster string) runtime.Object {
+	return ingressApp(cluster, modelRef("Synced", "Healthy"), externalModel("Synced", "Healthy"))
+}
+
+// forbidApplications makes every Application list Forbidden.
+func forbidApplications(client *fake.FakeDynamicClient) {
+	client.PrependReactor("list", "applications", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(applicationsResource.GroupResource(), "", errors.New("no access"))
 	})
 }
 
@@ -53,13 +66,19 @@ func clusterStatus(cluster string, phase aigridv1.ModelPhase, reason, message st
 const (
 	phaseReady   = aigridv1.ModelPhase_MODEL_PHASE_READY
 	phasePending = aigridv1.ModelPhase_MODEL_PHASE_PENDING
+	phaseFailed  = aigridv1.ModelPhase_MODEL_PHASE_FAILED
 	phasePartial = aigridv1.ModelPhase_MODEL_PHASE_PARTIALLY_AVAILABLE
+
+	llmReady    = "LLMInferenceService ready"
+	ingressOK   = "MaaSModelRef ready; ExternalModel ready"
+	combinedOK  = llmReady + "; " + ingressOK
+	llmNotReady = "LLMInferenceService not ready"
 )
 
 // TestModelsGitStatus checks the phase, reason and message of a model placed
 // on site-a and site-b, and its status on each of them (status.clusters),
-// from the status Policies' reports. Every ModelClusterStatus must pass the
-// buf.validate rules declared on it.
+// from the catalog Applications' reports. Every ModelClusterStatus must pass
+// the buf.validate rules declared on it.
 func TestModelsGitStatus(t *testing.T) {
 	t.Parallel()
 	for name, tc := range map[string]struct {
@@ -72,159 +91,213 @@ func TestModelsGitStatus(t *testing.T) {
 	}{
 		"ready": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "hub"),
-				clusterPolicy("hub", catalogStatusPolicy, modelRefReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				readyIngress("hub"),
 			},
 			wantPhase: phaseReady, wantReason: "Ready", wantMessage: "Ready on hub, site-a, site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
+		// Only ingress clusters have an ingress Application (demo1: site-a);
+		// an inference-only cluster isn't missing one.
 		"ready on a combined cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "site-a"),
-				clusterPolicy("site-a", catalogStatusPolicy, modelRefReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				readyIngress("site-a"),
 			},
 			wantPhase: phaseReady, wantReason: "Ready", wantMessage: "Ready on site-a, site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready; MaaSModelRef ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phaseReady, "Ready", combinedOK),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
 		"not ready on one cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(false)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Progressing", "starting")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
 			},
 			// No ingress cluster: nothing shows the model published.
 			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Not ready on site-a; ready on site-b; no ingress cluster has reported the MaaSModelRef",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NotReady", "LLMInferenceService not ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phasePending, "NotReady", llmNotReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
 		"not ready on one cluster, ready on the ingress": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(false)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "hub"),
-				clusterPolicy("hub", catalogStatusPolicy, modelRefReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Progressing", "starting")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				readyIngress("hub"),
 			},
 			wantPhase: phasePartial, wantReason: "PartiallyAvailable", wantMessage: "Not ready on site-a; ready on hub, site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NotReady", "LLMInferenceService not ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phasePending, "NotReady", llmNotReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
 		"not ready on one cluster and on the ingress": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(false)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "hub"),
-				clusterPolicy("hub", catalogStatusPolicy, modelRefReady(false)),
+				modelsApp("site-a", llmisvc("Synced", "Progressing", "starting")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", modelRef("Synced", "Progressing"), externalModel("Synced", "Healthy")),
 			},
 			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Not ready on hub, site-a; ready on site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NotReady", "LLMInferenceService not ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phasePending, "NotReady", llmNotReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
-		"not ready anywhere": {
+		"out of sync is not ready yet": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(false)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(false)),
+				modelsApp("site-a", llmisvc("OutOfSync", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				readyIngress("hub"),
 			},
-			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Not ready on site-a, site-b; no ingress cluster has reported the MaaSModelRef",
+			wantPhase: phasePartial, wantReason: "PartiallyAvailable", wantMessage: "Not ready on site-a; ready on hub, site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NotReady", "LLMInferenceService not ready"),
-				clusterStatus("site-b", phasePending, "NotReady", "LLMInferenceService not ready"),
+				clusterStatus("site-a", phasePending, "NotReady", llmNotReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
+			},
+		},
+		"failed on one cluster": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Degraded", "image pull failed")),
+				modelsApp("site-b", llmisvc("Synced", "Degraded", "image pull failed")),
+				readyIngress("hub"),
+			},
+			wantPhase: phaseFailed, wantReason: "Failed",
+			wantMessage: "Failed on site-a, site-b; ready on hub. LLMInferenceService on site-a: image pull failed; LLMInferenceService on site-b: image pull failed",
+			wantClusters: []*aigridv1.ModelClusterStatus{
+				clusterStatus("site-a", phaseFailed, "Failed", "LLMInferenceService failed"),
+				clusterStatus("site-b", phaseFailed, "Failed", "LLMInferenceService failed"),
+			},
+		},
+		// Ready somewhere outranks failed elsewhere (the console's order).
+		"failed on one cluster, ready on the other": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Degraded", "image pull failed")),
+				readyIngress("hub"),
+			},
+			wantPhase: phasePartial, wantReason: "PartiallyAvailable",
+			wantMessage: "Failed on site-b; ready on hub, site-a. LLMInferenceService on site-b: image pull failed",
+			wantClusters: []*aigridv1.ModelClusterStatus{
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
+				clusterStatus("site-b", phaseFailed, "Failed", "LLMInferenceService failed"),
+			},
+		},
+		// An AppProject refuses the model on site-b: pending with the reason
+		// while Argo CD retries, failed once the retries run out.
+		"refused by the AppProject, retrying": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				withRetry(application(DefaultCatalogModelsAppSet, "site-b", llmisvc("OutOfSync", "Missing", "")), refusal, 2),
+				readyIngress("site-a"),
+			},
+			wantPhase: phasePartial, wantReason: "PartiallyAvailable",
+			wantMessage: "Not ready on site-b; ready on site-a. LLMInferenceService on site-b: " + refusal,
+			wantClusters: []*aigridv1.ModelClusterStatus{
+				clusterStatus("site-a", phaseReady, "Ready", combinedOK),
+				clusterStatus("site-b", phasePending, "NotReady", llmNotReady),
+			},
+		},
+		"refused by the AppProject, retries exhausted": {
+			objects: []runtime.Object{
+				withSyncFailure(application(DefaultCatalogModelsAppSet, "site-a", llmisvc("OutOfSync", "Missing", "")), refusal),
+				withSyncFailure(application(DefaultCatalogModelsAppSet, "site-b", llmisvc("OutOfSync", "Missing", "")), refusal),
+			},
+			wantPhase: phaseFailed, wantReason: "Failed",
+			wantMessage: "Failed on site-a, site-b; no ingress cluster has reported the MaaSModelRef. LLMInferenceService on site-a: " + refusal + "; LLMInferenceService on site-b: " + refusal,
+			wantClusters: []*aigridv1.ModelClusterStatus{
+				clusterStatus("site-a", phaseFailed, "Failed", "LLMInferenceService failed"),
+				clusterStatus("site-b", phaseFailed, "Failed", "LLMInferenceService failed"),
 			},
 		},
 		"MaaSModelRef not ready on a combined cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "site-a"),
-				clusterPolicy("site-a", catalogStatusPolicy, modelRefReady(false)),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("site-a", modelRef("Synced", "Progressing"), externalModel("Synced", "Healthy")),
 			},
 			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Not ready on site-a; ready on site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NotReady", "LLMInferenceService ready; MaaSModelRef not ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phasePending, "NotReady", llmReady+"; MaaSModelRef not ready; ExternalModel ready"),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
-		"a placed cluster hasn't reported": {
+		"a placed cluster has no Application yet": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, map[string]string{modelsReadyCheck: "models-ready contains no object templates to check, and thus has no violations"}),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
 			},
 			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Ready on site-a; no report from site-b; no ingress cluster has reported the MaaSModelRef",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
 				clusterStatus("site-b", phasePending, "NoReport", "No LLMInferenceService report"),
 			},
 		},
-		"a placed cluster the Policy isn't placed on": {
+		// Just written: the Applications haven't picked it up.
+		"no Application lists the model yet": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b"),
+				readyIngress("hub"),
 			},
-			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Ready on site-a; no report from site-b; no ingress cluster has reported the MaaSModelRef",
+			wantPhase: phasePartial, wantReason: "PartiallyAvailable", wantMessage: "Ready on hub, site-a; no report from site-b",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
 				clusterStatus("site-b", phasePending, "NoReport", "No LLMInferenceService report"),
 			},
 		},
-		"MaaSModelRef not reported on a combined cluster": {
+		"MaaSModelRef not listed on a combined cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "site-a"),
-				clusterPolicy("site-a", catalogStatusPolicy, map[string]string{modelRefsReadyCheck: msgEmpty}),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("site-a"),
 			},
 			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Ready on site-b; no report from site-a",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phasePending, "NoReport", "LLMInferenceService ready; no MaaSModelRef report"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phasePending, "NoReport", llmReady+"; no MaaSModelRef report; no ExternalModel report"),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
-		"MaaSModelRef missing on an ingress cluster": {
+		"the ExternalModel is missing on an ingress cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-				clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-				rootPolicy(catalogStatusPolicy, "hub", "edge"),
-				clusterPolicy("hub", catalogStatusPolicy, modelRefReady(true)),
-				clusterPolicy("edge", catalogStatusPolicy, map[string]string{modelRefsReadyCheck: msgEmpty}),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", modelRef("Synced", "Healthy")),
 			},
-			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Ready on hub, site-a, site-b; no report from edge",
+			wantPhase: phasePending, wantReason: "NotReady", wantMessage: "Ready on site-a, site-b; no report from hub",
 			wantClusters: []*aigridv1.ModelClusterStatus{
-				clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready"),
-				clusterStatus("site-b", phaseReady, "Ready", "LLMInferenceService ready"),
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
+			},
+		},
+		// A cluster the model no longer is placed on, whose copy Argo CD is
+		// still pruning, doesn't count.
+		"a cluster the model left": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-c", llmisvc("OutOfSync", "Degraded", "being deleted")),
+				readyIngress("hub"),
+			},
+			wantPhase: phaseReady, wantReason: "Ready", wantMessage: "Ready on hub, site-a, site-b",
+			wantClusters: []*aigridv1.ModelClusterStatus{
+				clusterStatus("site-a", phaseReady, "Ready", llmReady),
+				clusterStatus("site-b", phaseReady, "Ready", llmReady),
 			},
 		},
 		"no reports": {
-			objects:    []runtime.Object{rootPolicy(modelsStatusPolicy, "site-a")},
+			objects:    nil,
 			wantReason: "SavedToGit", wantMessage: "Saved to Git; no cluster has reported the model's status",
 		},
 		"forbidden": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a"),
-				clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
 			},
 			forbid:     true,
 			wantReason: "SavedToGit", wantMessage: "Saved to Git; no cluster has reported the model's status",
@@ -233,12 +306,12 @@ func TestModelsGitStatus(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
-			client := newPolicyClient(tc.objects...)
+			client := newAppClient(tc.objects...)
 			if tc.forbid {
-				forbidPolicies(client)
+				forbidApplications(client)
 			}
 			srv, err := NewModelsServer().SetWriter(gitops.NewMemoryWriter(nil)).
-				SetCatalogStatus(NewCatalogStatusReader(client, "")).Build()
+				SetCatalogStatus(NewCatalogStatusReader(client, CatalogApps{})).Build()
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)
 			}
@@ -281,7 +354,7 @@ func TestModelsGitStatus(t *testing.T) {
 // and an empty reason.
 func TestModelClusterStatusValidationRules(t *testing.T) {
 	t.Parallel()
-	valid := clusterStatus("site-a", phaseReady, "Ready", "LLMInferenceService ready")
+	valid := clusterStatus("site-a", phaseReady, "Ready", llmReady)
 	if err := protovalidate.Validate(valid); err != nil {
 		t.Fatalf("protovalidate(%v) error = %v, want none", valid, err)
 	}
@@ -307,90 +380,100 @@ func TestModelClusterStatusValidationRules(t *testing.T) {
 
 func TestSubscriptionsGitStatus(t *testing.T) {
 	t.Parallel()
-	subscriptionActive := func(ready bool) string {
-		return statusMessage("maassubscriptions", "team-a", "models-as-a-service", ready)
+	sub := func(sync, health string) map[string]interface{} {
+		return appResource(kindMaaSSubscription, "team-a", sync, health, "")
 	}
-	refReady := func(ready bool) string {
-		return statusMessage("maasmodelrefs", "sim-model", "models-as-a-service", ready)
+	policy := func(sync, health string) map[string]interface{} {
+		return appResource(kindMaaSAuthPolicy, "team-a-policy", sync, health, "")
 	}
-	policyActive := func(ready bool) string {
-		return statusMessage("maasauthpolicies", "team-a-policy", "models-as-a-service", ready)
-	}
-	catalog := func(ready bool) map[string]string {
-		return map[string]string{
-			subscriptionsActiveCheck: subscriptionActive(ready),
-			modelRefsReadyCheck:      refReady(ready),
-			authPoliciesActiveCheck:  policyActive(ready),
-		}
+	ref := func(sync, health string) map[string]interface{} {
+		return appResource(kindMaaSModelRef, "sim-model", sync, health, "")
 	}
 	for name, tc := range map[string]struct {
 		objects           []runtime.Object
 		forbid            bool
 		wantPhase         string
-		wantModelPhase    string
-		wantReason        string
 		wantPolicyPhase   string
 		wantPolicyMessage string
+		wantModelPhase    string
+		wantReason        string
 	}{
 		"active": {
 			objects: []runtime.Object{
-				rootPolicy(catalogStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(true)),
-				clusterPolicy("site-b", catalogStatusPolicy, catalog(true)),
+				subscriptionsApp("site-a", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				subscriptionsApp("site-b", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				ingressApp("site-a", ref("Synced", "Healthy")),
+				ingressApp("site-b", ref("Synced", "Healthy")),
 			},
-			wantPhase: "Active", wantModelPhase: "Ready", wantReason: "Ready",
-			wantPolicyPhase: "Active", wantPolicyMessage: "Ready on site-a, site-b",
+			wantPhase: "Active", wantPolicyPhase: "Active", wantPolicyMessage: "Ready on site-a, site-b",
+			wantModelPhase: "Ready", wantReason: "Ready",
 		},
-		"not active on one cluster": {
+		"pending on one cluster": {
 			objects: []runtime.Object{
-				rootPolicy(catalogStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(false)),
-				clusterPolicy("site-b", catalogStatusPolicy, catalog(true)),
+				subscriptionsApp("site-a", sub("Synced", "Progressing"), policy("OutOfSync", "Healthy")),
+				subscriptionsApp("site-b", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				ingressApp("site-a", ref("Synced", "Progressing")),
+				ingressApp("site-b", ref("Synced", "Healthy")),
 			},
-			wantPhase: "Pending", wantModelPhase: "Pending", wantReason: "NotReady",
-			wantPolicyPhase: "Pending", wantPolicyMessage: "Not ready on site-a; ready on site-b",
+			wantPhase: "Pending", wantPolicyPhase: "Pending", wantPolicyMessage: "Not ready on site-a; ready on site-b",
+			wantModelPhase: "Pending", wantReason: "NotReady",
 		},
-		// An ingress cluster that doesn't have the objects yet, or hasn't
-		// reported, keeps them from Active and Ready.
+		"degraded on one cluster": {
+			objects: []runtime.Object{
+				subscriptionsApp("site-a", sub("Synced", "Degraded"), policy("Synced", "Degraded")),
+				subscriptionsApp("site-b", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				ingressApp("site-a", ref("Synced", "Degraded")),
+				ingressApp("site-b", ref("Synced", "Healthy")),
+			},
+			wantPhase: "Degraded", wantPolicyPhase: "Degraded", wantPolicyMessage: "Failed on site-a; ready on site-b",
+			wantModelPhase: "Failed", wantReason: "Failed",
+		},
+		"refused by the AppProject": {
+			objects: []runtime.Object{
+				withRetry(application(DefaultCatalogSubscriptionsAppSet, "site-a", sub("OutOfSync", "Missing"), policy("OutOfSync", "Missing")), refusal, 1),
+				ingressApp("site-a", ref("Synced", "Healthy")),
+			},
+			wantPhase: "Pending", wantPolicyPhase: "Pending", wantPolicyMessage: "Not ready on site-a",
+			wantModelPhase: "Ready", wantReason: "Ready",
+		},
+		"refused by the AppProject, retries exhausted": {
+			objects: []runtime.Object{
+				withSyncFailure(application(DefaultCatalogSubscriptionsAppSet, "site-a", sub("OutOfSync", "Missing"), policy("OutOfSync", "Missing")), refusal),
+				ingressApp("site-a", ref("Synced", "Healthy")),
+			},
+			wantPhase: "Degraded", wantPolicyPhase: "Degraded", wantPolicyMessage: "Failed on site-a",
+			wantModelPhase: "Ready", wantReason: "Ready",
+		},
+		// A cluster that doesn't list the objects yet keeps them from Active
+		// and Ready.
 		"missing on one cluster": {
 			objects: []runtime.Object{
-				rootPolicy(catalogStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(true)),
-				clusterPolicy("site-b", catalogStatusPolicy, map[string]string{subscriptionsActiveCheck: msgEmpty, modelRefsReadyCheck: msgEmpty, authPoliciesActiveCheck: msgEmpty}),
+				subscriptionsApp("site-a", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				subscriptionsApp("site-b"),
+				ingressApp("site-a", ref("Synced", "Healthy")),
+				ingressApp("site-b"),
 			},
-			wantPhase: "Pending", wantModelPhase: "Pending", wantReason: "NotReady",
-			wantPolicyPhase: "Pending", wantPolicyMessage: "Ready on site-a; no report from site-b",
+			wantPhase: "Pending", wantPolicyPhase: "Pending", wantPolicyMessage: "Ready on site-a; no report from site-b",
+			wantModelPhase: "Pending", wantReason: "NotReady",
 		},
-		"one cluster hasn't reported": {
-			objects: []runtime.Object{
-				rootPolicy(catalogStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(true)),
-			},
-			wantPhase: "Pending", wantModelPhase: "Pending", wantReason: "NotReady",
-			wantPolicyPhase: "Pending", wantPolicyMessage: "Ready on site-a; no report from site-b",
-		},
-		// Subscriptions and their policies go to the ingress clusters, the
-		// ones the catalog Policy is placed on. An inference-only cluster,
-		// which only the models Policy reports for, has no say in their
-		// status.
+		// Subscriptions go to the clusters with a subscriptions Application;
+		// an inference-only cluster has no say in their status.
 		"inference-only cluster": {
 			objects: []runtime.Object{
-				rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-				clusterPolicy("site-b", modelsStatusPolicy, map[string]string{modelsReadyCheck: msgEmpty}),
-				rootPolicy(catalogStatusPolicy, "site-a"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(true)),
+				subscriptionsApp("site-a", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				ingressApp("site-a", ref("Synced", "Healthy")),
+				modelsApp("site-b"),
 			},
-			wantPhase: "Active", wantModelPhase: "Ready", wantReason: "Ready",
-			wantPolicyPhase: "Active", wantPolicyMessage: "Ready on site-a",
+			wantPhase: "Active", wantPolicyPhase: "Active", wantPolicyMessage: "Ready on site-a",
+			wantModelPhase: "Ready", wantReason: "Ready",
 		},
 		"no reports": {
-			objects:    []runtime.Object{rootPolicy(catalogStatusPolicy, "site-a")},
+			objects:    nil,
 			wantReason: "SavedToGit",
 		},
 		"forbidden": {
 			objects: []runtime.Object{
-				rootPolicy(catalogStatusPolicy, "site-a"),
-				clusterPolicy("site-a", catalogStatusPolicy, catalog(true)),
+				subscriptionsApp("site-a", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
 			},
 			forbid:     true,
 			wantReason: "SavedToGit",
@@ -399,12 +482,12 @@ func TestSubscriptionsGitStatus(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
-			client := newPolicyClient(tc.objects...)
+			client := newAppClient(tc.objects...)
 			if tc.forbid {
-				forbidPolicies(client)
+				forbidApplications(client)
 			}
 			srv, err := NewSubscriptionsServer().SetWriter(gitops.NewMemoryWriter(gitModelSeed("sim-model"))).
-				SetCatalogStatus(NewCatalogStatusReader(client, "")).Build()
+				SetCatalogStatus(NewCatalogStatusReader(client, CatalogApps{})).Build()
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)
 			}
@@ -425,22 +508,23 @@ func TestSubscriptionsGitStatus(t *testing.T) {
 					t.Errorf("%s status.phase = %q, want %q", op, phase, tc.wantPhase)
 				}
 			}
-			regs := got.GetModelRegistrations()
-			if len(regs) != 1 || regs[0].GetName() != "sim-model" || regs[0].GetPhase() != tc.wantModelPhase || regs[0].GetConditions()[0].GetReason() != tc.wantReason {
-				t.Fatalf("Get model_registrations = %v, want phase %q, reason %q", regs, tc.wantModelPhase, tc.wantReason)
-			}
 			if len(got.GetAuthPolicies()) != 1 {
 				t.Fatalf("Get auth_policies = %v, want team-a-policy", got.GetAuthPolicies())
 			}
 			for op, policy := range map[string]*aigridv1.AuthPolicy{"Create": created.GetAuthPolicy(), "Get": got.GetAuthPolicies()[0]} {
 				checkAuthPolicyStatus(t, op, policy, "team-a-policy", tc.wantPolicyPhase, tc.wantPolicyMessage)
 			}
+			regs := got.GetModelRegistrations()
+			if len(regs) != 1 || regs[0].GetName() != "sim-model" || regs[0].GetPhase() != tc.wantModelPhase || regs[0].GetConditions()[0].GetReason() != tc.wantReason {
+				t.Fatalf("Get model_registrations = %v, want phase %q, reason %q", regs, tc.wantModelPhase, tc.wantReason)
+			}
 		})
 	}
 }
 
 // checkAuthPolicyStatus checks an AuthPolicy's phase and its Ready
-// condition: none without a phase, True with Active, False with Pending.
+// condition: none without a phase, True with Active, False with reason
+// Failed with Degraded, and False with reason NotReady with Pending.
 func checkAuthPolicyStatus(t *testing.T, op string, policy *aigridv1.AuthPolicy, wantID, wantPhase, wantMessage string) {
 	t.Helper()
 	if policy.GetId() != wantID || policy.GetPhase() != wantPhase {
@@ -454,7 +538,10 @@ func checkAuthPolicyStatus(t *testing.T, op string, policy *aigridv1.AuthPolicy,
 		return
 	}
 	wantStatus, wantReason := aigridv1.ConditionStatus_CONDITION_STATUS_TRUE, "Ready"
-	if wantPhase != "Active" {
+	switch wantPhase {
+	case "Degraded":
+		wantStatus, wantReason = aigridv1.ConditionStatus_CONDITION_STATUS_FALSE, "Failed"
+	case "Pending":
 		wantStatus, wantReason = aigridv1.ConditionStatus_CONDITION_STATUS_FALSE, "NotReady"
 	}
 	if len(conditions) != 1 || conditions[0].GetType() != "Ready" || conditions[0].GetStatus() != wantStatus ||
@@ -463,87 +550,23 @@ func checkAuthPolicyStatus(t *testing.T, op string, policy *aigridv1.AuthPolicy,
 	}
 }
 
-// TestSubscriptionsGitStatusFromHub reads the status Policies as a real hub
-// reports them (testdata/hub-status-policies.json). site-a, a combined
-// cluster, reports subscription granite-org1, its policy granite-org1-policy
-// and model granite-4-tiny active; site-b, an inference-only cluster, has no
-// copy of the catalog Policy and so no say in the subscription's status.
-func TestSubscriptionsGitStatusFromHub(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	status := NewCatalogStatusReader(newPolicyClient(hubStatusPolicies(t)...), "")
-	srv, err := NewSubscriptionsServer().SetWriter(gitops.NewMemoryWriter(gitModelSeed("granite-4-tiny"))).
-		SetCatalogStatus(status).Build()
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	object := gitSampleSubscription("granite-org1")
-	object.Spec.ModelRefs[0].Name = "granite-4-tiny"
-	created, err := srv.Create(ctx, &aigridv1.SubscriptionsCreateRequest{Object: object})
-	if err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	got, err := srv.Get(ctx, &aigridv1.SubscriptionsGetRequest{Id: "granite-org1"})
-	if err != nil {
-		t.Fatalf("Get() error = %v", err)
-	}
-	if phase := got.GetObject().GetStatus().GetPhase(); phase != "Active" {
-		t.Errorf("Get status.phase = %q, want Active", phase)
-	}
-	if len(got.GetAuthPolicies()) != 1 {
-		t.Fatalf("Get auth_policies = %v, want granite-org1-policy", got.GetAuthPolicies())
-	}
-	for op, policy := range map[string]*aigridv1.AuthPolicy{"Create": created.GetAuthPolicy(), "Get": got.GetAuthPolicies()[0]} {
-		checkAuthPolicyStatus(t, op, policy, "granite-org1-policy", "Active", "Ready on site-a")
-	}
-	regs := got.GetModelRegistrations()
-	if len(regs) != 1 || regs[0].GetPhase() != "Ready" || regs[0].GetConditions()[0].GetMessage() != "Ready on site-a" {
-		t.Errorf("Get model_registrations = %v, want granite-4-tiny Ready on site-a", regs)
-	}
-}
-
-// hubStatusPolicies returns the Policies in testdata/hub-status-policies.json.
-func hubStatusPolicies(t *testing.T) []runtime.Object {
-	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("testdata", "hub-status-policies.json"))
-	if err != nil {
-		t.Fatalf("read fixture: %v", err)
-	}
-	var list struct {
-		Items []map[string]interface{} `json:"items"`
-	}
-	if err := json.Unmarshal(raw, &list); err != nil {
-		t.Fatalf("unmarshal fixture: %v", err)
-	}
-	objects := make([]runtime.Object, 0, len(list.Items))
-	for _, item := range list.Items {
-		objects = append(objects, &unstructured.Unstructured{Object: item})
-	}
-	return objects
-}
-
 // TestModelsGitStatusIngressClusters checks that READY and
 // PARTIALLY_AVAILABLE need ingress evidence. With no ingress report and no
 // cluster labelled as ingress, a model ready on every placed cluster is
-// PENDING, not READY (as on main) or PARTIALLY_AVAILABLE. A cluster labelled
+// PENDING, not READY or PARTIALLY_AVAILABLE. A cluster labelled
 // ai-grid/enabled "true" and ai-grid/role ingress or combined must report
-// the MaaSModelRef even when the catalog Policy doesn't list it (not placed
-// there yet, or the Policy can't be read).
+// the MaaSModelRef even when it has no ingress Application (Argo CD hasn't
+// reached it yet, or the Applications can't be read).
 func TestModelsGitStatusIngressClusters(t *testing.T) {
 	t.Parallel()
 	ingress := map[string]string{"ai-grid/enabled": "true", "ai-grid/role": "ingress"}
 	modelsReady := []runtime.Object{
-		rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-		clusterPolicy("site-a", modelsStatusPolicy, modelReady(true)),
-		clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
+		modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+		modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
 	}
 	partial := []runtime.Object{
-		rootPolicy(modelsStatusPolicy, "site-a", "site-b"),
-		clusterPolicy("site-a", modelsStatusPolicy, modelReady(false)),
-		clusterPolicy("site-b", modelsStatusPolicy, modelReady(true)),
-	}
-	hubReports := func(ready bool) []runtime.Object {
-		return []runtime.Object{rootPolicy(catalogStatusPolicy, "hub"), clusterPolicy("hub", catalogStatusPolicy, modelRefReady(ready))}
+		modelsApp("site-a", llmisvc("Synced", "Progressing", "starting")),
+		modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
 	}
 	for name, tc := range map[string]struct {
 		objects     []runtime.Object
@@ -561,25 +584,25 @@ func TestModelsGitStatusIngressClusters(t *testing.T) {
 			wantPhase: phasePending, wantMessage: "Ready on site-a, site-b; no report from hub",
 		},
 		"labelled ingress, reported ready": {
-			objects:   append(append(slices.Clone(modelsReady), hubReports(true)...), managedCluster("hub", ingress, true)),
+			objects:   append(slices.Clone(modelsReady), readyIngress("hub"), managedCluster("hub", ingress, true)),
 			wantPhase: phaseReady, wantMessage: "Ready on hub, site-a, site-b",
 		},
 		"partial, labelled ingress reported ready": {
-			objects:   append(append(slices.Clone(partial), hubReports(true)...), managedCluster("hub", ingress, true)),
+			objects:   append(slices.Clone(partial), readyIngress("hub"), managedCluster("hub", ingress, true)),
 			wantPhase: phasePartial, wantMessage: "Not ready on site-a; ready on hub, site-b",
-			wantSiteA: "LLMInferenceService not ready",
+			wantSiteA: llmNotReady,
 		},
 		"partial, labelled ingress not reported": {
 			objects:   append(slices.Clone(partial), managedCluster("hub", ingress, true)),
 			wantPhase: phasePending, wantMessage: "Not ready on site-a; ready on site-b; no report from hub",
-			wantSiteA: "LLMInferenceService not ready",
+			wantSiteA: llmNotReady,
 		},
 		"labelled combined cluster, not reported": {
-			objects: append(append(slices.Clone(modelsReady), hubReports(true)...),
+			objects: append(slices.Clone(modelsReady), readyIngress("hub"),
 				managedCluster("hub", ingress, true),
 				managedCluster("site-a", map[string]string{"ai-grid/enabled": "true", "ai-grid/role": "combined"}, true)),
 			wantPhase: phasePending, wantMessage: "Ready on hub, site-b; no report from site-a",
-			wantSiteA: "LLMInferenceService ready; no MaaSModelRef report",
+			wantSiteA: llmReady + "; no MaaSModelRef report; no ExternalModel report",
 		},
 		"ingress label on a cluster not in the grid": {
 			objects: append(slices.Clone(modelsReady),
@@ -587,7 +610,7 @@ func TestModelsGitStatusIngressClusters(t *testing.T) {
 			wantPhase: phasePending, wantMessage: "Ready on site-a, site-b; no ingress cluster has reported the MaaSModelRef",
 		},
 		"cluster list fails": {
-			objects:   append(append(slices.Clone(modelsReady), hubReports(true)...), managedCluster("edge", ingress, true)),
+			objects:   append(slices.Clone(modelsReady), readyIngress("hub"), managedCluster("edge", ingress, true)),
 			listFails: true,
 			wantPhase: phaseReady, wantMessage: "Ready on hub, site-a, site-b",
 		},
@@ -606,12 +629,9 @@ func TestModelsGitStatusIngressClusters(t *testing.T) {
 					objects = append(objects, managedCluster(name, nil, true))
 				}
 			}
-			client := fake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{
-				policiesResource:        "PolicyList",
-				managedClustersResource: "ManagedClusterList",
-			}, objects...)
+			client := newAppClient(objects...)
 			srv, err := NewModelsServer().SetLogger(slog.New(slog.DiscardHandler)).SetWriter(gitops.NewMemoryWriter(nil)).
-				SetCatalogStatus(NewCatalogStatusReader(client, "")).SetDynamicClient(client).Build()
+				SetCatalogStatus(NewCatalogStatusReader(client, CatalogApps{})).SetDynamicClient(client).Build()
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)
 			}
@@ -633,7 +653,7 @@ func TestModelsGitStatusIngressClusters(t *testing.T) {
 			}
 			wantSiteA := tc.wantSiteA
 			if wantSiteA == "" {
-				wantSiteA = "LLMInferenceService ready"
+				wantSiteA = llmReady
 			}
 			if len(st.GetClusters()) != 2 || st.GetClusters()[0].GetMessage() != wantSiteA {
 				t.Errorf("status.clusters = %v; want site-a %q", st.GetClusters(), wantSiteA)

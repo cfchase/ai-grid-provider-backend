@@ -54,7 +54,7 @@ func (s *SubscriptionsServer) gitList(ctx context.Context) ([]*aigridv1.Subscrip
 		return nil, subscriptionGitError("list", "", err)
 	}
 	items := make([]*aigridv1.Subscription, 0, len(names))
-	active := s.readReports(ctx, subscriptionsActiveCheck)
+	active := s.readReports(ctx, kindMaaSSubscription)
 	catalog := s.modelCatalog(head)
 	for _, name := range names {
 		id, ok := strings.CutSuffix(name, ".yaml")
@@ -156,39 +156,56 @@ func (s *SubscriptionsServer) gitGet(ctx context.Context, id string) (*aigridv1.
 	}
 	s.modelCatalog(head).join(doc.sub)
 	resp := &aigridv1.SubscriptionsGetResponse{
-		Object:             withSubscriptionPhase(doc.sub, s.readReports(ctx, subscriptionsActiveCheck)),
-		ModelRegistrations: gitModelRegistrations(doc.sub, s.namespace, s.readReports(ctx, modelRefsReadyCheck)),
+		Object:             withSubscriptionPhase(doc.sub, s.readReports(ctx, kindMaaSSubscription)),
+		ModelRegistrations: gitModelRegistrations(doc.sub, s.namespace, s.readIngressReports(ctx, kindMaaSModelRef)),
 	}
 	if doc.policy != nil {
-		resp.AuthPolicies = []*aigridv1.AuthPolicy{withAuthPolicyStatus(doc.policy, s.readReports(ctx, authPoliciesActiveCheck))}
+		resp.AuthPolicies = []*aigridv1.AuthPolicy{withAuthPolicyStatus(doc.policy, s.readReports(ctx, kindMaaSAuthPolicy))}
 	}
 	return resp, nil
 }
 
-func (s *SubscriptionsServer) readReports(ctx context.Context, check string) ObjectReports {
+// readReports reads kind from the subscriptions ApplicationSet's Applications.
+func (s *SubscriptionsServer) readReports(ctx context.Context, kind string) ObjectReports {
 	if s.status == nil {
 		return nil
 	}
-	return readReports(ctx, s.logger, s.status, catalogStatusPolicy, check)
+	return readReports(ctx, s.logger, s.status, SubscriptionsSet, kind)
 }
 
-// withSubscriptionPhase sets status.phase from the ingress clusters'
-// subscriptions-active reports: Active when every cluster the Policy is
-// placed on has the subscription as specified, Pending when any has it not as
-// specified, doesn't have it yet or hasn't reported, and empty when no cluster
-// has reported.
-func withSubscriptionPhase(sub *aigridv1.Subscription, active ObjectReports) *aigridv1.Subscription {
-	if !active.any() {
-		return sub
+// readIngressReports reads kind from the ingress ApplicationSet's Applications.
+func (s *SubscriptionsServer) readIngressReports(ctx context.Context, kind string) ObjectReports {
+	if s.status == nil {
+		return nil
 	}
-	ready, notReady, missing := objectClusters(active, sub.GetId())
-	phase := ""
+	return readReports(ctx, s.logger, s.status, IngressSet, kind)
+}
+
+// maasPhase is the MaaS phase the clusters' reports add up to: Degraded when
+// any cluster reports the object failed, Pending when any reports it pending
+// or doesn't list it yet, Active when every cluster reports it ready, and
+// empty when no cluster has an Application to report from.
+func maasPhase(reports ObjectReports, name string) string {
+	if !reports.any() {
+		return ""
+	}
+	ready, pending, failed, missing := objectClusters(reports, name)
 	switch {
-	case len(notReady) > 0 || len(missing) > 0:
-		phase = "Pending"
+	case len(failed) > 0:
+		return "Degraded"
+	case len(pending) > 0 || len(missing) > 0:
+		return "Pending"
 	case len(ready) > 0:
-		phase = "Active"
-	default:
+		return "Active"
+	}
+	return ""
+}
+
+// withSubscriptionPhase sets status.phase from the clusters' MaaSSubscription
+// reports (maasPhase), and leaves it empty when no cluster has reported.
+func withSubscriptionPhase(sub *aigridv1.Subscription, reports ObjectReports) *aigridv1.Subscription {
+	phase := maasPhase(reports, sub.GetId())
+	if phase == "" {
 		return sub
 	}
 	if sub.Status == nil {
@@ -199,35 +216,39 @@ func withSubscriptionPhase(sub *aigridv1.Subscription, active ObjectReports) *ai
 }
 
 // withAuthPolicyStatus sets the subscription's MaaSAuthPolicy's phase and
-// Ready condition from the ingress clusters' auth-policies-active reports, as
-// gitModelRegistrations does for MaaSModelRefs: phase Active when every
-// cluster the Policy is placed on has the policy as specified (phase Active
-// there), Pending when any has it not as specified, doesn't have it yet or
-// hasn't reported, and the condition's message says which cluster is which.
-// With no report at all the policy has no phase and no condition, as the file
-// has none.
-func withAuthPolicyStatus(policy *aigridv1.AuthPolicy, active ObjectReports) *aigridv1.AuthPolicy {
-	if policy == nil || !active.any() {
+// Ready condition from the subscriptions Applications' MaaSAuthPolicy
+// reports, as gitModelRegistrations does for MaaSModelRefs: phase Active when
+// every cluster reports the policy ready, Degraded when any reports it
+// failed, Pending when any reports it pending or doesn't list it yet, and the
+// condition's message says which cluster is which. With no report at all the
+// policy has no phase and no condition, as the file has none.
+func withAuthPolicyStatus(policy *aigridv1.AuthPolicy, reports ObjectReports) *aigridv1.AuthPolicy {
+	if policy == nil || !reports.any() {
 		return policy
 	}
-	condition := clustersReadyCondition(objectClusters(active, policy.GetId()))
-	policy.Phase = phaseFromCondition(condition, "Active")
+	ready, pending, failed, missing := objectClusters(reports, policy.GetId())
+	condition := clustersReadyCondition(failed, pending, ready, missing)
+	policy.Phase = phaseFromCondition(condition, "Active", "Degraded")
 	policy.Conditions = []*aigridv1.Condition{condition}
 	return policy
 }
 
 // clustersReadyCondition is a Ready condition from the clusters that report
-// an object ready, not ready, or not at all: True, reason Ready, when only
-// ready ones do, and False, reason NotReady, otherwise. Its message says
-// which cluster is which.
-func clustersReadyCondition(ready, notReady, missing []string) *aigridv1.Condition {
+// an object failed, not ready, ready, or not at all: True, reason Ready, when
+// only ready ones do; False, reason Failed, when any reports it failed; and
+// False, reason NotReady, otherwise. Its message says which cluster is which.
+func clustersReadyCondition(failed, notReady, ready, missing []string) *aigridv1.Condition {
 	condition := &aigridv1.Condition{
 		Type:    "Ready",
 		Status:  aigridv1.ConditionStatus_CONDITION_STATUS_TRUE,
 		Reason:  proto.String("Ready"),
-		Message: proto.String(clusterSummary(notReady, ready, missing)),
+		Message: proto.String(clusterSummary(failed, notReady, ready, missing)),
 	}
-	if len(notReady)+len(missing) > 0 {
+	switch {
+	case len(failed) > 0:
+		condition.Status = aigridv1.ConditionStatus_CONDITION_STATUS_FALSE
+		condition.Reason = proto.String("Failed")
+	case len(notReady)+len(missing) > 0:
 		condition.Status = aigridv1.ConditionStatus_CONDITION_STATUS_FALSE
 		condition.Reason = proto.String("NotReady")
 	}
@@ -235,34 +256,37 @@ func clustersReadyCondition(ready, notReady, missing []string) *aigridv1.Conditi
 }
 
 // phaseFromCondition is the phase a clustersReadyCondition gives: readyPhase
-// when it is True, Pending otherwise.
-func phaseFromCondition(condition *aigridv1.Condition, readyPhase string) string {
-	if condition.GetStatus() == aigridv1.ConditionStatus_CONDITION_STATUS_TRUE {
+// when it is True, failedPhase when its reason is Failed, Pending otherwise.
+func phaseFromCondition(condition *aigridv1.Condition, readyPhase, failedPhase string) string {
+	switch {
+	case condition.GetStatus() == aigridv1.ConditionStatus_CONDITION_STATUS_TRUE:
 		return readyPhase
+	case condition.GetReason() == "Failed":
+		return failedPhase
 	}
 	return "Pending"
 }
 
 // gitModelRegistrations stands in for the MaaSModelRef status a cluster
-// reports, from the ingress clusters' model-refs-ready reports: phase Ready
-// when every cluster the Policy is placed on has the MaaSModelRef ready, and
-// Pending when any has it not ready, doesn't have it yet or hasn't reported. A model with no report, or in another namespace
+// reports, from the ingress Applications: phase Ready when every cluster
+// reports the MaaSModelRef ready, Failed when any reports it failed, and
+// Pending when any reports it pending or doesn't list it yet. A model with no report, or in another namespace
 // than the one the Models API writes MaaSModelRefs to, has no phase and a
 // Ready condition of unknown status, saying it was saved to Git. Without an
 // entry, a client takes the model as missing.
 func gitModelRegistrations(sub *aigridv1.Subscription, namespace string, modelRefs ObjectReports) []*aigridv1.ModelRegistration {
 	var out []*aigridv1.ModelRegistration
 	for _, ref := range sub.GetSpec().GetModelRefs() {
-		var ready, notReady, missing []string
+		var ready, notReady, failed, missing []string
 		if ref.GetNamespace() == namespace && modelRefs.any() {
-			ready, notReady, missing = objectClusters(modelRefs, ref.GetName())
+			ready, notReady, failed, missing = objectClusters(modelRefs, ref.GetName())
 		}
-		if len(ready)+len(notReady)+len(missing) > 0 {
-			condition := clustersReadyCondition(ready, notReady, missing)
+		if len(ready)+len(notReady)+len(failed)+len(missing) > 0 {
+			condition := clustersReadyCondition(failed, notReady, ready, missing)
 			out = append(out, &aigridv1.ModelRegistration{
 				Name:       ref.GetName(),
 				Namespace:  ref.GetNamespace(),
-				Phase:      phaseFromCondition(condition, "Ready"),
+				Phase:      phaseFromCondition(condition, "Ready", "Failed"),
 				Conditions: []*aigridv1.Condition{condition},
 			})
 			continue
@@ -309,8 +333,8 @@ func (s *SubscriptionsServer) gitCreate(ctx context.Context, object *aigridv1.Su
 	// The commit changes no catalog entry, so the snapshot read still holds.
 	s.modelCatalog(head).join(doc.sub)
 	return &aigridv1.SubscriptionsCreateResponse{
-		Object:     withSubscriptionPhase(doc.sub, s.readReports(ctx, subscriptionsActiveCheck)),
-		AuthPolicy: withAuthPolicyStatus(doc.policy, s.readReports(ctx, authPoliciesActiveCheck)),
+		Object:     withSubscriptionPhase(doc.sub, s.readReports(ctx, kindMaaSSubscription)),
+		AuthPolicy: withAuthPolicyStatus(doc.policy, s.readReports(ctx, kindMaaSAuthPolicy)),
 	}, nil
 }
 
@@ -341,7 +365,7 @@ func (s *SubscriptionsServer) gitUpdate(ctx context.Context, req *aigridv1.Subsc
 	// nothing.
 	if !paths.labels && !paths.annotations && !paths.anySpec() {
 		s.modelCatalog(head).join(current.sub)
-		return &aigridv1.SubscriptionsUpdateResponse{Object: withSubscriptionPhase(current.sub, s.readReports(ctx, subscriptionsActiveCheck))}, nil
+		return &aigridv1.SubscriptionsUpdateResponse{Object: withSubscriptionPhase(current.sub, s.readReports(ctx, kindMaaSSubscription))}, nil
 	}
 
 	candidate := mergeSubscriptionUpdate(current.sub, object, paths)
@@ -370,7 +394,7 @@ func (s *SubscriptionsServer) gitUpdate(ctx context.Context, req *aigridv1.Subsc
 	}
 	// As in gitCreate.
 	s.modelCatalog(head).join(doc.sub)
-	return &aigridv1.SubscriptionsUpdateResponse{Object: withSubscriptionPhase(doc.sub, s.readReports(ctx, subscriptionsActiveCheck))}, nil
+	return &aigridv1.SubscriptionsUpdateResponse{Object: withSubscriptionPhase(doc.sub, s.readReports(ctx, kindMaaSSubscription))}, nil
 }
 
 // gitDelete removes the subscription's file, and with it the managed policy.

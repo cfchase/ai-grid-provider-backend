@@ -16,9 +16,8 @@ import (
 // on every ManagedCluster labelled ai-grid/enabled=true (Placement
 // ai-grid-spokes), Compliant once the cluster's DataScienceCluster is Ready
 // and its grid operator runs. The fake computes this root Policy's
-// per-cluster status from the clusters. Every other Policy it serves, such as
-// the status Policies ai-grid-models-status and ai-grid-catalog-status and
-// their per-cluster copies, comes as is from policies.json.
+// per-cluster status from the clusters. Every other Policy it serves comes as
+// is from policies.json.
 const (
 	policiesPath         = "/apis/policy.open-cluster-management.io/v1/namespaces"
 	ReadyPolicyNamespace = "ai-grid-policies"

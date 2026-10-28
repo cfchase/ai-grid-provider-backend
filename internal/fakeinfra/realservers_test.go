@@ -599,7 +599,7 @@ func TestRealClustersServerProvisioning(t *testing.T) {
 
 // startCatalogServers starts the fake hub and builds the real Models and
 // Subscriptions servers on it, as make dev-fake does: status from the hub's
-// status Policies, commits to an in-memory repository, which is returned.
+// catalog Applications, commits to an in-memory repository, which is returned.
 func startCatalogServers(t *testing.T) (*servers.ModelsServer, *servers.SubscriptionsServer, *gitops.MemoryWriter) {
 	t.Helper()
 	return startCatalogServersFrom(t, fixturesDir)
@@ -614,7 +614,7 @@ func startCatalogServersFrom(t *testing.T, dir string) (*servers.ModelsServer, *
 	if err != nil {
 		t.Fatalf("dynamic.NewForConfig() error = %v", err)
 	}
-	status := servers.NewCatalogStatusReader(client, "")
+	status := servers.NewCatalogStatusReader(client, servers.CatalogApps{})
 	writer := gitops.NewMemoryWriter(nil)
 	models, err := servers.NewModelsServer().SetLogger(slog.New(slog.DiscardHandler)).
 		SetWriter(writer).SetCatalogStatus(status).SetDynamicClient(client).Build()
@@ -630,8 +630,8 @@ func startCatalogServersFrom(t *testing.T, dir string) (*servers.ModelsServer, *
 }
 
 // The real Models and Subscriptions servers, committing to an in-memory
-// repository, read status from the fake hub's status Policies
-// (fixtures/default/policies.json), as in make dev-fake.
+// repository, read status from the fake hub's catalog Applications
+// (fixtures/default/applications.json), as in make dev-fake.
 func TestRealCatalogStatusOnFakeHub(t *testing.T) {
 	models, subscriptions, _ := startCatalogServers(t)
 	ctx := context.Background()
@@ -693,8 +693,8 @@ func TestRealCatalogStatusOnFakeHub(t *testing.T) {
 	}
 }
 
-// The real Models server on fixtures/poc, as in make dev-fake-poc: its status
-// Policies report granite-3b as fixtures/default does, on the PoC's sites, so
+// The real Models server on fixtures/poc, as in make dev-fake-poc: its catalog
+// Applications report granite-3b as fixtures/default does, on the PoC's sites, so
 // a model placed on site1 and site2 is partially available.
 func TestRealModelsPartiallyAvailableOnPocFakeHub(t *testing.T) {
 	models, _, _ := startCatalogServersFrom(t, filepath.Join("..", "..", "fixtures", "poc"))
@@ -817,7 +817,7 @@ func TestRealModelsPlacementClustersOnFakeHub(t *testing.T) {
 		}
 	}
 	models, err := servers.NewModelsServer().SetLogger(slog.New(slog.DiscardHandler)).
-		SetWriter(gitops.NewMemoryWriter(nil)).SetCatalogStatus(servers.NewCatalogStatusReader(client, "")).
+		SetWriter(gitops.NewMemoryWriter(nil)).SetCatalogStatus(servers.NewCatalogStatusReader(client, servers.CatalogApps{})).
 		SetDynamicClient(client).Build()
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
