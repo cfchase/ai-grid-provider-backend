@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"testing"
 
@@ -335,7 +336,10 @@ func TestModelsGitStatus(t *testing.T) {
 				if st.GetPlacement().GetNumberOfSelectedClusters() != 2 {
 					t.Errorf("%s placement = %v, want site-a and site-b", op, st.GetPlacement())
 				}
-				if !slices.EqualFunc(st.GetClusters(), tc.wantClusters, func(a, b *aigridv1.ModelClusterStatus) bool { return proto.Equal(a, b) }) {
+				// The deployment fields are TestModelsGitTwoStatuses's.
+				if !slices.EqualFunc(st.GetClusters(), tc.wantClusters, func(a, b *aigridv1.ModelClusterStatus) bool {
+					return proto.Equal(clusterStatus(a.GetCluster(), a.GetPhase(), a.GetReason(), a.GetMessage()), b)
+				}) {
 					t.Errorf("%s status.clusters = %v; want %v", op, st.GetClusters(), tc.wantClusters)
 				}
 				for _, cluster := range st.GetClusters() {
@@ -443,6 +447,16 @@ func TestSubscriptionsGitStatus(t *testing.T) {
 			},
 			wantPhase: "Degraded", wantPolicyPhase: "Degraded", wantPolicyMessage: "Failed on site-a",
 			wantModelPhase: "Ready", wantReason: "Ready",
+		},
+		// MaaS hasn't paired the model with this subscription yet: pending,
+		// not failed.
+		"model awaiting its pairing": {
+			objects: []runtime.Object{
+				subscriptionsApp("site-a", sub("Synced", "Healthy"), policy("Synced", "Healthy")),
+				ingressApp("site-a", appResource(kindMaaSModelRef, "sim-model", "Synced", "Degraded", "Awaiting governance pairing")),
+			},
+			wantPhase: "Active", wantPolicyPhase: "Active", wantPolicyMessage: "Ready on site-a",
+			wantModelPhase: "Pending", wantReason: "NotReady",
 		},
 		// A cluster that doesn't list the objects yet keeps them from Active
 		// and Ready.
@@ -657,6 +671,186 @@ func TestModelsGitStatusIngressClusters(t *testing.T) {
 			}
 			if len(st.GetClusters()) != 2 || st.GetClusters()[0].GetMessage() != wantSiteA {
 				t.Errorf("status.clusters = %v; want site-a %q", st.GetClusters(), wantSiteA)
+			}
+		})
+	}
+}
+
+// TestModelsGitTwoStatuses checks a model's deployment status on each placed
+// cluster and its MaaS status on each ingress cluster, kept apart: a model
+// that runs but has no subscription is READY with MaaS NO_SUBSCRIPTION, not
+// PENDING (ai-grid-1 dry run, 2026-10-29).
+func TestModelsGitTwoStatuses(t *testing.T) {
+	t.Parallel()
+	const (
+		running  = aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_RUNNING
+		starting = aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_STARTING
+		depFail  = aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_FAILED
+		depNone  = aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_UNSPECIFIED
+
+		published = aigridv1.ModelMaasState_MODEL_MAAS_STATE_PUBLISHED
+		noSub     = aigridv1.ModelMaasState_MODEL_MAAS_STATE_NO_SUBSCRIPTION
+		notReady  = aigridv1.ModelMaasState_MODEL_MAAS_STATE_NOT_READY
+		maasFail  = aigridv1.ModelMaasState_MODEL_MAAS_STATE_FAILED
+		maasNone  = aigridv1.ModelMaasState_MODEL_MAAS_STATE_UNSPECIFIED
+
+		awaiting = "Awaiting governance pairing"
+		minAvail = "Deployment does not have minimum availability."
+	)
+	ref := func(health, message string) map[string]interface{} {
+		return appResource(kindMaaSModelRef, "granite", "Synced", health, message)
+	}
+	type dep struct {
+		state   aigridv1.ModelDeploymentState
+		message string
+	}
+	ingress := func(cluster string, state aigridv1.ModelMaasState, message string) *aigridv1.ModelIngressStatus {
+		return &aigridv1.ModelIngressStatus{Cluster: cluster, State: state, Message: message}
+	}
+	for name, tc := range map[string]struct {
+		objects        []runtime.Object
+		labelled       []string
+		wantPhase      aigridv1.ModelPhase
+		wantDeployment aigridv1.ModelDeploymentState
+		wantMaaS       aigridv1.ModelMaasState
+		wantPlaced     map[string]dep
+		wantIngress    []*aigridv1.ModelIngressStatus
+	}{
+		"running, no subscription": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "LLMInferenceService is ready")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "LLMInferenceService is ready")),
+				ingressApp("hub", ref("Degraded", awaiting), externalModel("Synced", "Healthy")),
+			},
+			wantPhase: phaseReady, wantDeployment: running, wantMaaS: noSub,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", noSub, awaiting)},
+		},
+		"running and published": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", ref("Healthy", "Governed and runtime-healthy"), externalModel("Synced", "Healthy")),
+			},
+			wantPhase: phaseReady, wantDeployment: running, wantMaaS: published,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", published, "")},
+		},
+		"starting on one cluster": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Degraded", minAvail)),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", ref("Degraded", "Awaiting governance pairing and backend readiness"), externalModel("Synced", "Healthy")),
+			},
+			wantPhase: phasePending, wantDeployment: starting, wantMaaS: notReady,
+			wantPlaced:  map[string]dep{"site-a": {starting, minAvail}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", notReady, "Awaiting governance pairing and backend readiness")},
+		},
+		"failed on one cluster, no subscription": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Degraded", "config llm-template not found")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", ref("Degraded", awaiting), externalModel("Synced", "Healthy")),
+			},
+			wantPhase: phasePartial, wantDeployment: depFail, wantMaaS: noSub,
+			wantPlaced:  map[string]dep{"site-a": {depFail, "config llm-template not found"}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", noSub, awaiting)},
+		},
+		"the ExternalModel failed": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("hub", ref("Degraded", awaiting), appResource(kindExternalModel, "granite", "Synced", "Degraded", "provider grid-provider not found")),
+			},
+			wantPhase: phaseFailed, wantDeployment: running, wantMaaS: maasFail,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", maasFail, "provider grid-provider not found")},
+		},
+		"a combined cluster has both": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				ingressApp("site-a", ref("Degraded", awaiting), externalModel("Synced", "Healthy")),
+			},
+			wantPhase: phaseReady, wantDeployment: running, wantMaaS: noSub,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("site-a", noSub, awaiting)},
+		},
+		"a placed cluster hasn't reported": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				readyIngress("hub"),
+			},
+			wantPhase: phasePartial, wantDeployment: starting, wantMaaS: published,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {depNone, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("hub", published, "")},
+		},
+		"a labelled ingress cluster hasn't reported": {
+			objects: []runtime.Object{
+				modelsApp("site-a", llmisvc("Synced", "Healthy", "")),
+				modelsApp("site-b", llmisvc("Synced", "Healthy", "")),
+				readyIngress("hub"),
+			},
+			labelled:  []string{"hub", "edge"},
+			wantPhase: phasePending, wantDeployment: running, wantMaaS: notReady,
+			wantPlaced:  map[string]dep{"site-a": {running, ""}, "site-b": {running, ""}},
+			wantIngress: []*aigridv1.ModelIngressStatus{ingress("edge", maasNone, ""), ingress("hub", published, "")},
+		},
+		"no reports": {
+			wantDeployment: depNone, wantMaaS: maasNone,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			objects := slices.Clone(tc.objects)
+			objects = append(objects, managedCluster("site-a", nil, true), managedCluster("site-b", nil, true))
+			for _, cluster := range tc.labelled {
+				objects = append(objects, managedCluster(cluster, map[string]string{"ai-grid/enabled": "true", "ai-grid/role": "ingress"}, true))
+			}
+			client := newAppClient(objects...)
+			srv, err := NewModelsServer().SetLogger(slog.New(slog.DiscardHandler)).SetWriter(gitops.NewMemoryWriter(nil)).
+				SetCatalogStatus(NewCatalogStatusReader(client, CatalogApps{})).SetDynamicClient(client).Build()
+			if err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: gitSampleModel("granite", "site-a", "site-b")}); err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			got, err := srv.Get(ctx, &aigridv1.ModelsGetRequest{Id: "granite"})
+			if err != nil {
+				t.Fatalf("Get() error = %v", err)
+			}
+			list, err := srv.List(ctx, &aigridv1.ModelsListRequest{})
+			if err != nil {
+				t.Fatalf("List() error = %v", err)
+			}
+			for op, model := range map[string]*aigridv1.Model{"Get": got.GetObject(), "List": list.GetItems()[0]} {
+				st := model.GetStatus()
+				if st.GetPhase() != tc.wantPhase || st.GetDeployment() != tc.wantDeployment || st.GetMaas() != tc.wantMaaS {
+					t.Errorf("%s phase, deployment, maas = %v, %v, %v; want %v, %v, %v (%q)", op,
+						st.GetPhase(), st.GetDeployment(), st.GetMaas(), tc.wantPhase, tc.wantDeployment, tc.wantMaaS, st.GetMessage())
+				}
+				placed := map[string]dep{}
+				for _, c := range st.GetClusters() {
+					placed[c.GetCluster()] = dep{c.GetDeployment(), c.GetDeploymentMessage()}
+					if err := protovalidate.Validate(c); err != nil {
+						t.Errorf("%s clusters[%s] fails its rules: %v", op, c.GetCluster(), err)
+					}
+				}
+				if len(tc.wantPlaced) > 0 || len(placed) > 0 {
+					if !maps.Equal(placed, tc.wantPlaced) {
+						t.Errorf("%s clusters deployment = %v; want %v", op, placed, tc.wantPlaced)
+					}
+				}
+				if !slices.EqualFunc(st.GetIngress(), tc.wantIngress, func(a, b *aigridv1.ModelIngressStatus) bool { return proto.Equal(a, b) }) {
+					t.Errorf("%s ingress = %v; want %v", op, st.GetIngress(), tc.wantIngress)
+				}
+				for _, in := range st.GetIngress() {
+					if err := protovalidate.Validate(in); err != nil {
+						t.Errorf("%s ingress[%s] fails its rules: %v", op, in.GetCluster(), err)
+					}
+				}
 			}
 		})
 	}

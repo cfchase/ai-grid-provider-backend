@@ -323,6 +323,33 @@ For models:
   ready on site-b`, followed by Argo CD's message for each failed object.
   With no report at all, it has no phase, reason `SavedToGit` and no
   `clusters`.
+- **Two statuses.** The phase answers "can tenants use it?"; two more fields
+  keep the deployment and MaaS apart, so a running model with no
+  subscription doesn't read as starting:
+  - `status.clusters[].deployment` is each placed cluster's
+    `LLMInferenceService`: `RUNNING`, `STARTING` (not synced yet,
+    progressing, or a step KServe reports still under way, such as
+    `Deployment does not have minimum availability.`), `FAILED` (any other
+    `Ready=False`, or a failed sync), or unspecified with no report;
+    `deployment_message` is KServe's or Argo CD's message.
+    `status.deployment` sums them: `RUNNING` when every placed cluster runs
+    it, `FAILED` when one fails, `STARTING` otherwise.
+  - `status.ingress[]` has one entry per ingress cluster with its MaaS
+    `state`: `PUBLISHED` (`MaaSModelRef` ready), `NO_SUBSCRIPTION` (MaaS
+    says `Awaiting governance pairing`: the backend is healthy but no
+    `MaaSSubscription` and `MaaSAuthPolicy` pair covers the model),
+    `NOT_READY`, `FAILED`, or unspecified with no report. `status.maas` sums
+    them, worst first: `FAILED`, `NOT_READY` (also while one hasn't
+    reported), `NO_SUBSCRIPTION`, `PUBLISHED`.
+  A `MaaSModelRef` waiting only for a subscription counts as ready for the
+  phase, so such a model is `READY` with `status.maas` `NO_SUBSCRIPTION`.
+  `STARTING` has no deadline: a pod that keeps crashing, can't pull its
+  image or finds no GPU also leaves its Deployment below minimum
+  availability, so it shows as `STARTING` with that message until it's
+  fixed. Argo CD's health keeps only the `Ready` condition's message, not
+  the pods'. `status.deployment` can differ from the phase: failed on one
+  cluster and running on another is `FAILED` there and
+  `PARTIALLY_AVAILABLE` in the phase.
 - `spec.main.requests` and `limits` must be Kubernetes quantities that
   Kubernetes accepts for a container: non-negative, whole numbers for
   extended resources such as `nvidia.com/gpu`, a request at most its limit,

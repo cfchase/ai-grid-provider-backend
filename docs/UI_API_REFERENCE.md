@@ -639,19 +639,50 @@ Once a cluster reports, the status also has the model on each placed cluster
 "status": {
   "phase": "MODEL_PHASE_PARTIALLY_AVAILABLE",
   "reason": "PartiallyAvailable",
-  "message": "Not ready on site-a; ready on site-b",
+  "message": "Not ready on site-a; ready on hub, site-b",
+  "deployment": "MODEL_DEPLOYMENT_STATE_STARTING",
+  "maas": "MODEL_MAAS_STATE_NO_SUBSCRIPTION",
   "clusters": [
-    {"cluster": "site-a", "phase": "MODEL_PHASE_PENDING", "reason": "NotReady", "message": "LLMInferenceService not ready"},
-    {"cluster": "site-b", "phase": "MODEL_PHASE_READY", "reason": "Ready", "message": "LLMInferenceService ready"}
+    {"cluster": "site-a", "phase": "MODEL_PHASE_PENDING", "reason": "NotReady", "message": "LLMInferenceService not ready",
+     "deployment": "MODEL_DEPLOYMENT_STATE_STARTING", "deploymentMessage": "Deployment does not have minimum availability."},
+    {"cluster": "site-b", "phase": "MODEL_PHASE_READY", "reason": "Ready", "message": "LLMInferenceService ready",
+     "deployment": "MODEL_DEPLOYMENT_STATE_RUNNING"}
+  ],
+  "ingress": [
+    {"cluster": "hub", "state": "MODEL_MAAS_STATE_NO_SUBSCRIPTION", "message": "Awaiting governance pairing"}
   ]
 }
 ```
 
-A cluster's `phase` is `MODEL_PHASE_READY` or `MODEL_PHASE_PENDING`; its
-`reason` is `Ready`, `NotReady` or `NoReport` (no report yet); on a combined
-cluster the `MaaSModelRef` report counts too, and the message names both, such
-as `LLMInferenceService ready; MaaSModelRef not ready`. Ingress clusters the
-model isn't placed on have no entry. `status.rollout` is never set.
+A cluster's `phase` is `MODEL_PHASE_READY`, `MODEL_PHASE_FAILED` or
+`MODEL_PHASE_PENDING`; its `reason` is `Ready`, `Failed`, `NotReady` or
+`NoReport` (no report yet); on a combined cluster the `MaaSModelRef` and
+`ExternalModel` reports count too, and the message names them all, such as
+`LLMInferenceService ready; MaaSModelRef not ready; ExternalModel ready`.
+Ingress clusters the model isn't placed on have no entry in `clusters`.
+`status.rollout` is never set.
+
+The two statuses keep the model's deployment apart from MaaS, so a list can
+show both, such as "Running · No subscription":
+
+- `deployment` on each `clusters` entry: `RUNNING`, `STARTING` (with KServe's
+  message, such as `Deployment does not have minimum availability.`),
+  `FAILED` (with the message), or `UNSPECIFIED` with no report.
+  `status.deployment` is `RUNNING` when every placed cluster runs it, `FAILED`
+  when one fails, `STARTING` otherwise.
+- `ingress`: one entry per ingress cluster (combined ones included), with
+  `state` `PUBLISHED`, `NO_SUBSCRIPTION` (running, but no subscription covers
+  it, so no tenant can call it), `NOT_READY`, `FAILED`, or `UNSPECIFIED` with
+  no report, and MaaS's message. `status.maas` is the worst of them, in the
+  order `FAILED`, `NOT_READY` (also while one hasn't reported),
+  `NO_SUBSCRIPTION`, `PUBLISHED`.
+
+A model waiting only for a subscription is `MODEL_PHASE_READY` (or
+`PARTIALLY_AVAILABLE`) with `status.maas` `MODEL_MAAS_STATE_NO_SUBSCRIPTION`,
+not `PENDING`. `STARTING` has no deadline: a pod that keeps crashing, can't
+pull its image or finds no GPU also shows as `STARTING`, because Argo CD keeps
+only KServe's `Ready` message, which then still says the Deployment is below
+its minimum availability.
 
 `selected_clusters` holds cluster names, the values `spec.placement` takes.
 `locations` holds the distinct values of those clusters' `location` label;

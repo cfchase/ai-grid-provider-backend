@@ -659,8 +659,10 @@ func TestRealCatalogStatusOnFakeHub(t *testing.T) {
 		t.Fatalf("model status = %v, %q, %q", st.GetPhase(), st.GetReason(), st.GetMessage())
 	}
 	wantClusters := []*aigridv1.ModelClusterStatus{
-		{Cluster: "site-madrid-1", Phase: aigridv1.ModelPhase_MODEL_PHASE_PENDING, Reason: "NotReady", Message: "LLMInferenceService not ready"},
-		{Cluster: "site-paris-1", Phase: aigridv1.ModelPhase_MODEL_PHASE_READY, Reason: "Ready", Message: "LLMInferenceService ready"},
+		{Cluster: "site-madrid-1", Phase: aigridv1.ModelPhase_MODEL_PHASE_PENDING, Reason: "NotReady", Message: "LLMInferenceService not ready",
+			Deployment: aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_STARTING, DeploymentMessage: "Waiting for the main workload"},
+		{Cluster: "site-paris-1", Phase: aigridv1.ModelPhase_MODEL_PHASE_READY, Reason: "Ready", Message: "LLMInferenceService ready",
+			Deployment: aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_RUNNING},
 	}
 	if !slices.EqualFunc(st.GetClusters(), wantClusters, func(a, b *aigridv1.ModelClusterStatus) bool { return proto.Equal(a, b) }) {
 		t.Fatalf("model status.clusters = %v, want %v", st.GetClusters(), wantClusters)
@@ -717,8 +719,10 @@ func TestRealModelsPartiallyAvailableOnPocFakeHub(t *testing.T) {
 		t.Fatalf("model status = %v, %q", st.GetPhase(), st.GetMessage())
 	}
 	wantClusters := []*aigridv1.ModelClusterStatus{
-		{Cluster: "site1", Phase: aigridv1.ModelPhase_MODEL_PHASE_READY, Reason: "Ready", Message: "LLMInferenceService ready"},
-		{Cluster: "site2", Phase: aigridv1.ModelPhase_MODEL_PHASE_PENDING, Reason: "NotReady", Message: "LLMInferenceService not ready"},
+		{Cluster: "site1", Phase: aigridv1.ModelPhase_MODEL_PHASE_READY, Reason: "Ready", Message: "LLMInferenceService ready",
+			Deployment: aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_RUNNING},
+		{Cluster: "site2", Phase: aigridv1.ModelPhase_MODEL_PHASE_PENDING, Reason: "NotReady", Message: "LLMInferenceService not ready",
+			Deployment: aigridv1.ModelDeploymentState_MODEL_DEPLOYMENT_STATE_STARTING, DeploymentMessage: "Waiting for the main workload"},
 	}
 	if !slices.EqualFunc(st.GetClusters(), wantClusters, func(a, b *aigridv1.ModelClusterStatus) bool { return proto.Equal(a, b) }) {
 		t.Fatalf("model status.clusters = %v, want %v", st.GetClusters(), wantClusters)
