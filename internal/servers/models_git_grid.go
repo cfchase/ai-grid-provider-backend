@@ -133,9 +133,16 @@ func gridLabels(id string) map[string]interface{} {
 }
 
 // checkServedNameFree refuses a model whose served name another model already
-// serves on one of clusters: both HTTPRoutes would match the same header on
-// that cluster's models Gateway. The same name on other clusters is allowed;
-// it is one model served in more places.
+// serves, when the two would be confused:
+//
+//   - on a shared cluster, both HTTPRoutes would match the same header on that
+//     cluster's models Gateway;
+//   - on any cluster, from another source (model URI or image): an ingress
+//     cluster balances a name across every site serving it, so tenants asking
+//     for the name would get either model.
+//
+// The same source on other clusters is one model served in more places, and
+// is allowed.
 func checkServedNameFree(head gitops.Snapshot, object *aigridv1.Model, clusters []string) error {
 	resources, err := readKustomizationResources(head, ingressGitIndex)
 	if err != nil {
@@ -159,6 +166,9 @@ func checkServedNameFree(head gitops.Snapshot, object *aigridv1.Model, clusters 
 		if servedModelName(current.model) != served {
 			continue
 		}
+		if !sameModelSource(current.model, object) {
+			return connect.Errorf(connect.CodeAlreadyExists, "Model %q already serves %q from another model URI or image; the grid routes by that name, so use another model name", other, served)
+		}
 		for _, cluster := range clusters {
 			if slices.Contains(current.clusters, cluster) {
 				return connect.Errorf(connect.CodeAlreadyExists, "Model %q already serves %q on cluster %q; the grid routes by that name, so use another model name or cluster", other, served, cluster)
@@ -166,6 +176,13 @@ func checkServedNameFree(head gitops.Snapshot, object *aigridv1.Model, clusters 
 		}
 	}
 	return nil
+}
+
+// sameModelSource reports whether a and b serve the same thing: the same
+// model URI and the same main image.
+func sameModelSource(a, b *aigridv1.Model) bool {
+	return a.GetSpec().GetModel().GetUri() == b.GetSpec().GetModel().GetUri() &&
+		a.GetSpec().GetMain().GetImage() == b.GetSpec().GetMain().GetImage()
 }
 
 // validateModelGitMetadata is validateGitMetadata plus the models-only

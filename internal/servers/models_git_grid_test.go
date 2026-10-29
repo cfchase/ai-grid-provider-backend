@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	connect "connectrpc.com/connect/v2"
@@ -139,7 +140,8 @@ func TestModelsGitGridServedNameDefaultsToID(t *testing.T) {
 
 // Two models with one served name on one cluster would put two HTTPRoutes with
 // the same match on that cluster's models Gateway, so the second is refused.
-// On different clusters the name is the same model served in two places.
+// On different clusters the name is the same model served in two places, so
+// it is accepted only from the same source (TestModelsGitGridServedNameSource).
 func TestModelsGitGridServedNameConflict(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -253,4 +255,51 @@ func assertPeerProviders(t *testing.T, writer gitops.Writer, id string, clusters
 		}
 		assertProviderModels(t, p, "example/"+id)
 	}
+}
+
+// An ingress cluster balances one served name across every site that serves
+// it, so two models may share the name only when they serve the same thing:
+// the same model URI and the same image. Otherwise tenants asking for the name
+// would get either model.
+func TestModelsGitGridServedNameSource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	srv := mustGitModelsServer(t, gitops.NewMemoryWriter(nil))
+	shared := func(id, uri string, clusters ...string) *aigridv1.Model {
+		model := gitSampleModel(id, clusters...)
+		model.Spec.Model = &aigridv1.ModelSource{Uri: uri, Name: "shared/model"}
+		return model
+	}
+
+	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("first", "hf://org/one", "site-a")}); err != nil {
+		t.Fatalf("Create(first) error = %v", err)
+	}
+	_, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("other-uri", "hf://org/two", "site-b")})
+	assertConnectCode(t, err, connect.CodeAlreadyExists)
+	if err == nil || !strings.Contains(err.Error(), `"first"`) {
+		t.Fatalf("error = %v, want it to name model first", err)
+	}
+
+	otherImage := shared("other-image", "hf://org/one", "site-b")
+	otherImage.Spec.Main.Image = "quay.io/example/other:latest"
+	_, err = srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: otherImage})
+	assertConnectCode(t, err, connect.CodeAlreadyExists)
+
+	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("same", "hf://org/one", "site-b")}); err != nil {
+		t.Fatalf("Create(same) error = %v, want the same source on another cluster accepted", err)
+	}
+
+	// An update that moves a sharing model to another source collides too.
+	_, err = srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
+		Object:     shared("same", "hf://org/two", "site-b"),
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.model"}},
+	})
+	assertConnectCode(t, err, connect.CodeAlreadyExists)
+	image := shared("same", "hf://org/one", "site-b")
+	image.Spec.Main.Image = "quay.io/example/other:latest"
+	_, err = srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
+		Object:     image,
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.main.image"}},
+	})
+	assertConnectCode(t, err, connect.CodeAlreadyExists)
 }
