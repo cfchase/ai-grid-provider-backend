@@ -56,6 +56,16 @@ func TestModelsGitCRUD(t *testing.T) {
 	if _, found, _ := unstructured.NestedMap(llm.Object, "spec", "router", "scheduler"); !found {
 		t.Fatal("LLMInferenceService has no spec.router.scheduler")
 	}
+	// The grid operator scrapes the scheduler's metrics only over HTTPS.
+	containers, _, _ := unstructured.NestedSlice(llm.Object, "spec", "router", "scheduler", "template", "containers")
+	if len(containers) != 1 {
+		t.Fatalf("scheduler template containers = %v, want one main container", containers)
+	}
+	main, _ := containers[0].(map[string]interface{})
+	args, _, _ := unstructured.NestedStringSlice(main, "args")
+	if main["name"] != "main" || !slices.Equal(args, []string{"--metrics-cert-dir=/var/run/kserve/tls"}) {
+		t.Fatalf("scheduler main container = %v, want args [--metrics-cert-dir=/var/run/kserve/tls]", main)
+	}
 	policy := deployment[1]
 	if policy.GetKind() != "NetworkPolicy" || policy.GetName() != "sim-grid" || policy.GetNamespace() != "ai-grid-internal-models" {
 		t.Fatalf("deployment[1] kind = %q, name = %q, namespace = %q", policy.GetKind(), policy.GetName(), policy.GetNamespace())

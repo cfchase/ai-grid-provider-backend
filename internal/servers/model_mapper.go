@@ -336,6 +336,32 @@ func modelSpecToLLMMap(spec *aigridv1.ModelSpec, id string) map[string]interface
 	return out
 }
 
+// schedulerMetricsCertDirArg makes the scheduler (the llm-d EPP) serve its
+// metrics port, 9090, over HTTPS with the serving certificate KServe already
+// mounts for it. The grid operator scrapes that port with a ServiceAccount
+// token and refuses to send the token in plain text, so without this flag the
+// provider reports no load and the grid can't balance the model. KServe merges
+// these args with the scheduler preset's: the preset starts the EPP with
+// `command`, so `args` add to it and drop none of its flags. Once the RHOAI
+// payload has opendatahub-io/kserve#2128, the preset passes the same flag
+// itself when TLS is on, and the repeated flag is harmless. The flag and its
+// directory match kahowell/ai-grid-tenant's model definitions
+// (apps/acm-models/*/10-*-cpu.yaml, 960bd69).
+const schedulerMetricsCertDirArg = "--metrics-cert-dir=/var/run/kserve/tls"
+
+func schedulerWithHTTPSMetrics() map[string]interface{} {
+	return map[string]interface{}{
+		"template": map[string]interface{}{
+			"containers": []interface{}{
+				map[string]interface{}{
+					"name": "main",
+					"args": []interface{}{schedulerMetricsCertDirArg},
+				},
+			},
+		},
+	}
+}
+
 func modelRouterToMap(router *aigridv1.ModelRouter) map[string]interface{} {
 	out := map[string]interface{}{}
 	managedRoute := true
@@ -353,7 +379,7 @@ func modelRouterToMap(router *aigridv1.ModelRouter) map[string]interface{} {
 		out["route"] = map[string]interface{}{}
 	}
 	if scheduler {
-		out["scheduler"] = map[string]interface{}{}
+		out["scheduler"] = schedulerWithHTTPSMetrics()
 	}
 	if len(refs) == 0 {
 		refs = []*aigridv1.ModelGatewayRef{{

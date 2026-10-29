@@ -436,7 +436,8 @@ type ModelRouter struct {
 	GatewayRefs []*ModelGatewayRef `protobuf:"bytes,1,rep,name=gateway_refs,json=gatewayRefs,proto3" json:"gateway_refs,omitempty"`
 	// When true, controller manages the HTTPRoute (spec.router.route: {}).
 	ManagedRoute bool `protobuf:"varint,2,opt,name=managed_route,json=managedRoute,proto3" json:"managed_route,omitempty"`
-	// When true, inference scheduler is created (spec.router.scheduler: {}).
+	// When true, inference scheduler is created (spec.router.scheduler), with
+	// its metrics served over HTTPS so the grid operator can scrape them.
 	Scheduler     bool `protobuf:"varint,3,opt,name=scheduler,proto3" json:"scheduler,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

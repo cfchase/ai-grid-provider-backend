@@ -1940,7 +1940,7 @@
         },
         "scheduler": {
           "type": "boolean",
-          "description": "When true, inference scheduler is created (spec.router.scheduler: {})."
+          "description": "When true, inference scheduler is created (spec.router.scheduler), with\nits metrics served over HTTPS so the grid operator can scrape them."
         }
       },
       "description": "Router configuration (spec.router)."

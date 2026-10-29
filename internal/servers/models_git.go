@@ -449,7 +449,8 @@ func (s *ModelsServer) renderModelDeployment(object *aigridv1.Model, version int
 			"policyTypes": []interface{}{"Ingress"},
 			"ingress": []interface{}{map[string]interface{}{
 				// 8000: the grid gateway to the workload; 9090: the grid
-				// operator scraping the scheduler's metrics.
+				// operator scraping the scheduler's metrics, which it serves
+				// over HTTPS on the same port (schedulerMetricsCertDirArg).
 				"ports": []interface{}{
 					map[string]interface{}{"port": int64(8000), "protocol": "TCP"},
 					map[string]interface{}{"port": int64(9090), "protocol": "TCP"},

@@ -106,7 +106,8 @@ message ModelRouter {
   // When true, controller manages the HTTPRoute (spec.router.route: {}).
   bool managed_route = 2;
 
-  // When true, inference scheduler is created (spec.router.scheduler: {}).
+  // When true, inference scheduler is created (spec.router.scheduler), with
+  // its metrics served over HTTPS so the grid operator can scrape them.
   bool scheduler = 3;
 }
 
