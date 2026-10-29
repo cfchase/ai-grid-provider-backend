@@ -350,7 +350,8 @@ catalog. Three ApplicationSets in `AI_GRID_CATALOG_APP_NAMESPACE` (default
 
 An Application counts only when its ApplicationSet owns it. For each resource
 in its `status.resources[]`, `Synced` and health `Healthy` is ready; health
-`Degraded`, or out of sync after a failed sync, is failed; out of sync while
+`Degraded`, or out of sync after a failed sync, is failed, except the
+`Degraded` messages of steps still under way, which are pending; out of sync while
 Argo CD retries a failed sync (such as an AppProject refusing the kind or
 namespace, which shows only in `status.operationState.message`) is pending
 with that message; anything else
@@ -361,7 +362,26 @@ hub's Argo CD resource health checks, which the hub must have for
 `LLMInferenceService`, `ExternalModel`, `MaaSModelRef`, `MaaSSubscription` and
 `MaaSAuthPolicy`, as kahowell/ai-grid-tenant's `apps/gitops-config/manifests/argocd.yaml`
 does: Argo CD has none built in, and without them every model and subscription
-stays pending. A model the file places on a cluster that has no models
+stays pending.
+
+Those health checks map every `Ready=False` to `Degraded` and keep only the
+condition's message, but KServe and MaaS also set `Ready=False` for steps
+still under way. So a `Degraded` resource is pending when its message is one
+of these:
+
+| Kind | Message | Means |
+|---|---|---|
+| `LLMInferenceService` | names a step under way, in KServe's wording (any case): `does not have minimum availability`, `rollout in progress`, `is progressing`, `has not been observed yet`, `accepted them yet`, `accepted it yet`, `is not yet accepted by gateway`, a ScaledObject `not yet` visible, available or ready, `The following Gateways are not ready`, `is not ready` (an inference pool) or `waiting for`; and doesn't dump a rejected condition (` (reason `) | starting: KServe copies the first unready step, such as its Deployment's `Available=False` |
+| `MaaSModelRef` | `Awaiting governance pairing` | published, no subscription yet (`NO_SUBSCRIPTION`) |
+| `MaaSModelRef` | `Awaiting governance pairing and backend readiness`, `Governed but backend is not ready` | not ready yet |
+
+Any other `Degraded` message is failed. The messages are KServe's
+(`pkg/controller/v1alpha2/llmisvc`) and maas-controller's
+(`deriveModelPhase`); a release that rewords them turns that state into
+failed until this list follows. A health check that reported these steps
+as `Progressing` would make the list unnecessary.
+
+A model the file places on a cluster that has no models
 Application (not yet created, or the cluster left the catalog's Placement)
 reads "no report from" that cluster and stays pending until the placement
 changes. Until some cluster lists a new model, it stays saved to Git.

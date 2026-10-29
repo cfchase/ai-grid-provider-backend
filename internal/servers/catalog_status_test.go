@@ -327,3 +327,127 @@ func TestClusterSummary(t *testing.T) {
 		t.Fatalf("clusterSummary() = %q, want empty", got)
 	}
 }
+
+// TestCatalogStatusDegradedUnderWay checks the Degraded health messages that
+// are steps still under way, not failures. The catalog's health checks map
+// every Ready=False to Degraded, and KServe and MaaS set Ready=False while a
+// model starts or waits for a subscription.
+func TestCatalogStatusDegradedUnderWay(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		kind, message string
+		want          ObjectReport
+	}{
+		// KServe copies a not-yet-available Deployment's condition.
+		"model starting": {
+			kindLLMInferenceService, "Deployment does not have minimum availability.",
+			ObjectReport{State: StatePending, Message: "Deployment does not have minimum availability."},
+		},
+		"model's HTTPRoute not observed yet": {
+			kindLLMInferenceService, "The managed HTTPRoute has not been observed yet",
+			ObjectReport{State: StatePending, Message: "The managed HTTPRoute has not been observed yet"},
+		},
+		"model's Gateways not ready": {
+			kindLLMInferenceService, "The following Gateways are not ready: [gw]",
+			ObjectReport{State: StatePending, Message: "The following Gateways are not ready: [gw]"},
+		},
+		"model's inference pool not ready": {
+			kindLLMInferenceService, "The inference pool ns/pool is not ready",
+			ObjectReport{State: StatePending, Message: "The inference pool ns/pool is not ready"},
+		},
+		"model's rollout progressing": {
+			kindLLMInferenceService, "LWS is progressing",
+			ObjectReport{State: StatePending, Message: "LWS is progressing"},
+		},
+		"model waiting for its Gateway": {
+			kindLLMInferenceService, "Waiting for Gateway gw to be programmed",
+			ObjectReport{State: StatePending, Message: "Waiting for Gateway gw to be programmed"},
+		},
+		"model's rollout in progress": {
+			kindLLMInferenceService, "Deployment rollout in progress",
+			ObjectReport{State: StatePending, Message: "Deployment rollout in progress"},
+		},
+		"model's routes not accepted yet": {
+			kindLLMInferenceService, "The following HTTPRoutes exist but no Gateway controller has accepted them yet: [ns/r]",
+			ObjectReport{State: StatePending, Message: "The following HTTPRoutes exist but no Gateway controller has accepted them yet: [ns/r]"},
+		},
+		"model's ScaledObject not ready yet": {
+			kindLLMInferenceService, "ScaledObject is not yet ready",
+			ObjectReport{State: StatePending, Message: "ScaledObject is not yet ready"},
+		},
+		// KServe router.go: a rejected route dumps its condition.
+		"model's route rejected": {
+			kindLLMInferenceService, `The following HTTPRoutes are not ready: [ns/r: Accepted=False (reason "NotAllowedByListeners", message "x")]`,
+			ObjectReport{State: StateFailed, Message: `The following HTTPRoutes are not ready: [ns/r: Accepted=False (reason "NotAllowedByListeners", message "x")]`},
+		},
+		"model's route rejected while another waits": {
+			kindLLMInferenceService, `The following HTTPRoutes are not ready: [ns/r: Accepted=False (reason "NotAllowedByListeners", message "x")]; still waiting for a Gateway to accept: [ns/q]`,
+			ObjectReport{State: StateFailed, Message: `The following HTTPRoutes are not ready: [ns/r: Accepted=False (reason "NotAllowedByListeners", message "x")]; still waiting for a Gateway to accept: [ns/q]`},
+		},
+		"model's inference pool rejected": {
+			kindLLMInferenceService, `ns/p: Accepted="False" (reason "NotSupportedByGateway", message "y")`,
+			ObjectReport{State: StateFailed, Message: `ns/p: Accepted="False" (reason "NotSupportedByGateway", message "y")`},
+		},
+		"model with a bad config": {
+			kindLLMInferenceService, "config llm-template not found",
+			ObjectReport{State: StateFailed, Message: "config llm-template not found"},
+		},
+		"model stopped": {
+			kindLLMInferenceService, "Service is stopped",
+			ObjectReport{State: StateFailed, Message: "Service is stopped"},
+		},
+		// maas-controller deriveModelPhase: runtime ready, no pairing.
+		"model ref awaiting a subscription": {
+			kindMaaSModelRef, "Awaiting governance pairing",
+			ObjectReport{State: StatePending, Message: "Awaiting governance pairing", NoSubscription: true},
+		},
+		"model ref awaiting a subscription and its backend": {
+			kindMaaSModelRef, "Awaiting governance pairing and backend readiness",
+			ObjectReport{State: StatePending, Message: "Awaiting governance pairing and backend readiness"},
+		},
+		"model ref governed, backend not ready": {
+			kindMaaSModelRef, "Governed but backend is not ready",
+			ObjectReport{State: StatePending, Message: "Governed but backend is not ready"},
+		},
+		"model ref failed": {
+			kindMaaSModelRef, "Failed to update model status: boom",
+			ObjectReport{State: StateFailed, Message: "Failed to update model status: boom"},
+		},
+		// Startup messages count only for the kind that writes them.
+		"another kind's startup message": {
+			kindMaaSModelRef, "Deployment does not have minimum availability.",
+			ObjectReport{State: StateFailed, Message: "Deployment does not have minimum availability."},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			set := ModelsSet
+			if tc.kind != kindLLMInferenceService {
+				set = IngressSet
+			}
+			app := application(CatalogApps{}.withDefaults().name(set), "site-a", appResource(tc.kind, "m", "Synced", "Degraded", tc.message))
+			got, err := NewCatalogStatusReader(newAppClient(app), CatalogApps{}).Read(context.Background(), set, tc.kind)
+			if err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+			if want := (ObjectReports{"site-a": {"m": tc.want}}); !reflect.DeepEqual(got, want) {
+				t.Fatalf("Read() = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// An out-of-sync MaaSModelRef that says it awaits a subscription is the
+// previous revision: pending, not "published, no subscription".
+func TestCatalogStatusNoSubscriptionNeedsSync(t *testing.T) {
+	t.Parallel()
+	app := application(DefaultCatalogIngressAppSet, "site-a", appResource(kindMaaSModelRef, "m", "OutOfSync", "Degraded", "Awaiting governance pairing"))
+	got, err := NewCatalogStatusReader(newAppClient(app), CatalogApps{}).Read(context.Background(), IngressSet, kindMaaSModelRef)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	want := ObjectReports{"site-a": {"m": {State: StatePending, Message: "Awaiting governance pairing"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Read() = %v, want %v", got, want)
+	}
+}

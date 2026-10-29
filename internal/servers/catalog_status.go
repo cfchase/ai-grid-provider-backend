@@ -136,6 +136,10 @@ type ObjectReport struct {
 	// such as an AppProject refusing the kind or namespace. Message then
 	// says why.
 	Retrying bool
+	// NoSubscription: a MaaSModelRef whose backend is healthy but that no
+	// active MaaSSubscription and MaaSAuthPolicy pair covers yet. Its state
+	// is pending, because MaaS doesn't serve it to anyone yet.
+	NoSubscription bool
 }
 
 // ObjectReports maps each cluster that has an Application in the set to the
@@ -247,6 +251,12 @@ func applicationReports(app unstructured.Unstructured, kind string) map[string]O
 		switch {
 		case health == "Degraded":
 			report.State = StateFailed
+			if synced == "Synced" || !syncFailed {
+				report.State, report.NoSubscription = degradedUnderWay(kind, message)
+				// Out of sync, the live object is the previous revision:
+				// pending, whatever it says.
+				report.NoSubscription = report.NoSubscription && synced == "Synced"
+			}
 		case synced != "Synced" && syncFailed:
 			report = ObjectReport{State: StateFailed, Message: syncMessage}
 		case synced != "Synced" && retrying:
@@ -260,6 +270,76 @@ func applicationReports(app unstructured.Unstructured, kind string) map[string]O
 		out[name] = report
 	}
 	return out
+}
+
+// The Ready=False messages, by kind, that are steps still under way rather
+// than failures. The catalog's Argo CD health checks (kahowell/ai-grid-tenant
+// apps/gitops-config/manifests/argocd.yaml) map every Ready=False to
+// Degraded and keep only the condition's message, so the message is all
+// there is to tell them apart.
+var (
+	// KServe's LLMInferenceService copies the first unready step's message
+	// into Ready (pkg/controller/v1alpha2/llmisvc, opendatahub-io/kserve
+	// 5aabec9), lowercased here: a Deployment below its minimum availability
+	// or rolling out, a ScaledObject, route, Gateway or inference pool not
+	// accepted or ready yet. A message that dumps a route's or pool's
+	// condition, "<type>=False (reason ...)", is a rejection and stays failed
+	// (llmisvcRejected). A Deployment below its minimum availability has no
+	// deadline: a pod that keeps crashing, can't pull its image or finds no
+	// GPU leaves the same message, so it reads as starting too.
+	llmisvcStartingMessages = []string{
+		"does not have minimum availability",
+		"rollout in progress",
+		"is progressing",
+		"has not been observed yet",
+		"accepted them yet",
+		"accepted it yet",
+		"is not yet accepted by gateway",
+		"scaledobject not yet visible",
+		"scaledobject conditions not yet available",
+		"scaledobject is not yet ready",
+		"the following gateways are not ready",
+		"is not ready", // "The inference pool <ns>/<name> is not ready"
+		"waiting for",
+	}
+	// llmisvcRejected marks KServe's dump of a route's or pool's failed
+	// condition, such as "ns/x: Accepted=False (reason ...)".
+	llmisvcRejected = " (reason "
+	// maas-controller's MaaSModelRef Ready messages for phase Pending and
+	// Unhealthy (deriveModelPhase, opendatahub-io/models-as-a-service
+	// e7bd7fc0). The first means the backend is healthy and only a
+	// subscription is missing.
+	maasAwaitingSubscription = "Awaiting governance pairing"
+	maasPendingMessages      = []string{
+		"Awaiting governance pairing and backend readiness",
+		"Governed but backend is not ready",
+	}
+)
+
+// degradedUnderWay reads the message of a Degraded resource of kind: pending
+// when it names a step still under way (and, for a MaaSModelRef waiting only
+// for a subscription, noSubscription), failed otherwise.
+func degradedUnderWay(kind, message string) (state ObjectState, noSubscription bool) {
+	switch kind {
+	case kindLLMInferenceService:
+		if strings.Contains(message, llmisvcRejected) {
+			return StateFailed, false
+		}
+		lower := strings.ToLower(message)
+		for _, starting := range llmisvcStartingMessages {
+			if strings.Contains(lower, starting) {
+				return StatePending, false
+			}
+		}
+	case kindMaaSModelRef:
+		if message == maasAwaitingSubscription {
+			return StatePending, true
+		}
+		if slices.Contains(maasPendingMessages, message) {
+			return StatePending, false
+		}
+	}
+	return StateFailed, false
 }
 
 // worse reports whether state a is worse than b: failed, then pending, then
