@@ -73,7 +73,7 @@ func TestModelsGitCRUD(t *testing.T) {
 	if got, _, _ := unstructured.NestedString(policy.Object, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name"); got != "sim" {
 		t.Fatalf("NetworkPolicy podSelector app.kubernetes.io/name = %q", got)
 	}
-	if got := kustomizationResources(t, writer, "catalog/models/sim/deployment/kustomization.yaml"); !slices.Equal(got, []string{"deployment.yaml"}) {
+	if got := kustomizationResources(t, writer, "catalog/models/sim/deployment/kustomization.yaml"); !slices.Equal(got, []string{"deployment.yaml", "grid.yaml"}) {
 		t.Fatalf("deployment kustomization resources = %v", got)
 	}
 
@@ -353,7 +353,8 @@ func mustGitModelsServer(t *testing.T, writer gitops.Writer) *ModelsServer {
 	return srv
 }
 
-// gitSampleModel is a model with the scheduler, placed on the named clusters.
+// gitSampleModel is a model with the scheduler, served as example/<id>,
+// placed on the named clusters.
 func gitSampleModel(id string, clusters ...string) *aigridv1.Model {
 	replicas := int32(1)
 	model := &aigridv1.Model{
