@@ -45,6 +45,25 @@ const (
 	// clusterNameLabelKey is the label ACM sets on every ManagedCluster to
 	// its name.
 	clusterNameLabelKey = "name"
+
+	// modelAPIAnnotation picks the OpenAI API the ExternalModel calls on the
+	// model: modelAPIChat (the default) or modelAPICompletions, for base
+	// models whose tokenizer has no chat template.
+	modelAPIAnnotation  = "ai-grid/api"
+	modelAPIChat        = "chat"
+	modelAPICompletions = "completions"
+
+	// The grid routes a model by the name the ingress consumer puts in
+	// gridModelHeader. On each inference cluster the provider gateway
+	// forwards to the models Gateway, which the template installs, and each
+	// model's HTTPRoute there sends its name to the model's InferencePool.
+	gridModelHeader       = "X-Gateway-Model-Name"
+	gridModelsGateway     = "ai-grid-models"
+	gridModelsGatewayNS   = "openshift-ingress"
+	gridNetworkName       = "grid"
+	gridLocalBackend      = "local-models"
+	gridPeerBackendPrefix = "peer-"
+	gridSiteLabelKey      = "ai-grid/site"
 )
 
 func modelDeploymentGitDir(id string) string { return path.Join(modelsGitDir, id, "deployment") }
@@ -98,7 +117,7 @@ func (s *ModelsServer) gitGet(ctx context.Context, id string) (*aigridv1.Model, 
 
 func (s *ModelsServer) gitCreate(ctx context.Context, object *aigridv1.Model) (*aigridv1.Model, error) {
 	id := object.GetId()
-	if err := validateGitMetadata(object.GetMetadata()); err != nil {
+	if err := validateModelGitMetadata(object.GetMetadata()); err != nil {
 		return nil, err
 	}
 	clusters, err := gitPlacementClusters(object.GetSpec())
@@ -115,6 +134,9 @@ func (s *ModelsServer) gitCreate(ctx context.Context, object *aigridv1.Model) (*
 		return nil, modelGitError("create", id, err)
 	}
 	if err := s.checkPlacementClusters(ctx, clusters); err != nil {
+		return nil, err
+	}
+	if err := checkServedNameFree(head, object, clusters); err != nil {
 		return nil, err
 	}
 	return s.gitCommitModel(ctx, head, "create", object, 1, nil, clusters)
@@ -148,7 +170,7 @@ func (s *ModelsServer) gitUpdate(ctx context.Context, req *aigridv1.ModelsUpdate
 		return nil, err
 	}
 	merged.Status = nil
-	if err := validateGitMetadata(merged.GetMetadata()); err != nil {
+	if err := validateModelGitMetadata(merged.GetMetadata()); err != nil {
 		return nil, err
 	}
 	normalizeModelResources(merged.GetSpec().GetMain())
@@ -166,6 +188,9 @@ func (s *ModelsServer) gitUpdate(ctx context.Context, req *aigridv1.ModelsUpdate
 		}
 	}
 	if err := s.checkPlacementClusters(ctx, added); err != nil {
+		return nil, err
+	}
+	if err := checkServedNameFree(head, merged, clusters); err != nil {
 		return nil, err
 	}
 	return s.gitCommitModel(ctx, head, "update", merged, current.model.GetMetadata().GetVersion()+1, current.clusters, clusters)
@@ -225,10 +250,20 @@ func (s *ModelsServer) gitCommitModel(ctx context.Context, head gitops.Snapshot,
 	if err != nil {
 		return nil, connect.Errorf(connect.CodeInternal, "render model %q: %v", id, err).WithCause(err)
 	}
+	gridDeployment, err := s.renderModelGridDeployment(object)
+	if err != nil {
+		return nil, connect.Errorf(connect.CodeInternal, "render model %q: %v", id, err).WithCause(err)
+	}
+	gridCatalog, err := renderModelGridCatalog(object, to)
+	if err != nil {
+		return nil, connect.Errorf(connect.CodeInternal, "render model %q: %v", id, err).WithCause(err)
+	}
 	change.Put[path.Join(modelDeploymentGitDir(id), "deployment.yaml")] = deployment
-	change.Put[path.Join(modelDeploymentGitDir(id), "kustomization.yaml")] = renderKustomization([]string{"deployment.yaml"})
+	change.Put[path.Join(modelDeploymentGitDir(id), "grid.yaml")] = gridDeployment
+	change.Put[path.Join(modelDeploymentGitDir(id), "kustomization.yaml")] = renderKustomization([]string{"deployment.yaml", "grid.yaml"})
 	change.Put[path.Join(modelCatalogGitDir(id), "model.yaml")] = catalog
-	change.Put[path.Join(modelCatalogGitDir(id), "kustomization.yaml")] = renderKustomization([]string{"model.yaml"})
+	change.Put[path.Join(modelCatalogGitDir(id), "grid.yaml")] = gridCatalog
+	change.Put[path.Join(modelCatalogGitDir(id), "kustomization.yaml")] = renderKustomization([]string{"grid.yaml", "model.yaml"})
 	if err := putIndexChanges(head, change.Put, id, from, to, true); err != nil {
 		return nil, err
 	}
@@ -457,9 +492,10 @@ func (s *ModelsServer) renderModelDeployment(object *aigridv1.Model, version int
 // grid provider, and the MaaSModelRef that lists it in MaaS.
 func (s *ModelsServer) renderModelCatalog(object *aigridv1.Model) ([]byte, error) {
 	id := object.GetId()
-	target := object.GetSpec().GetModel().GetName()
-	if target == "" {
-		target = id
+	target := servedModelName(object)
+	apiPath := "/v1/chat/completions"
+	if object.GetMetadata().GetAnnotations()[modelAPIAnnotation] == modelAPICompletions {
+		apiPath = "/v1/completions"
 	}
 	external := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "inference.opendatahub.io/v1alpha1",
@@ -471,9 +507,11 @@ func (s *ModelsServer) renderModelCatalog(object *aigridv1.Model) ([]byte, error
 		},
 		"spec": map[string]interface{}{
 			"externalProviderRefs": []interface{}{map[string]interface{}{
-				"ref":         map[string]interface{}{"name": gridProviderName},
+				"ref": map[string]interface{}{"name": gridProviderName},
+				// MaaS has no completions format; openai-chat with the
+				// completions path is what the reference's sample uses.
 				"apiFormat":   "openai-chat",
-				"path":        "/v1/chat/completions",
+				"path":        apiPath,
 				"targetModel": target,
 				"weight":      int64(1),
 			}},

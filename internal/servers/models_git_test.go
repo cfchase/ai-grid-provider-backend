@@ -63,7 +63,7 @@ func TestModelsGitCRUD(t *testing.T) {
 	if got, _, _ := unstructured.NestedString(policy.Object, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name"); got != "sim" {
 		t.Fatalf("NetworkPolicy podSelector app.kubernetes.io/name = %q", got)
 	}
-	if got := kustomizationResources(t, writer, "catalog/models/sim/deployment/kustomization.yaml"); !slices.Equal(got, []string{"deployment.yaml"}) {
+	if got := kustomizationResources(t, writer, "catalog/models/sim/deployment/kustomization.yaml"); !slices.Equal(got, []string{"deployment.yaml", "grid.yaml"}) {
 		t.Fatalf("deployment kustomization resources = %v", got)
 	}
 
@@ -73,7 +73,7 @@ func TestModelsGitCRUD(t *testing.T) {
 		t.Fatalf("catalog[0] kind = %q, namespace = %q", external.GetKind(), external.GetNamespace())
 	}
 	refs, _, _ := unstructured.NestedSlice(external.Object, "spec", "externalProviderRefs")
-	if len(refs) != 1 || refs[0].(map[string]interface{})["targetModel"] != "facebook/opt-125m" {
+	if len(refs) != 1 || refs[0].(map[string]interface{})["targetModel"] != "example/sim" {
 		t.Fatalf("ExternalModel externalProviderRefs = %v", refs)
 	}
 	if kind, _, _ := unstructured.NestedString(modelRef.Object, "spec", "modelRef", "kind"); modelRef.GetKind() != maasModelRefKind || kind != "ExternalModel" || modelRef.GetNamespace() != "models-as-a-service" {
@@ -343,14 +343,17 @@ func mustGitModelsServer(t *testing.T, writer gitops.Writer) *ModelsServer {
 	return srv
 }
 
-// gitSampleModel is a model with the scheduler, placed on the named clusters.
+// gitSampleModel is a model with the scheduler, served as example/<id>,
+// placed on the named clusters.
 func gitSampleModel(id string, clusters ...string) *aigridv1.Model {
 	replicas := int32(1)
 	model := &aigridv1.Model{
 		Id:       id,
 		Metadata: &aigridv1.Metadata{Name: id, Annotations: map[string]string{"openshift.io/display-name": id}},
 		Spec: &aigridv1.ModelSpec{
-			Model:    &aigridv1.ModelSource{Uri: "hf://facebook/opt-125m", Name: "facebook/opt-125m"},
+			// Each id serves its own name: two models serving one name on one
+			// cluster conflict (checkServedNameFree).
+			Model:    &aigridv1.ModelSource{Uri: "hf://facebook/opt-125m", Name: "example/" + id},
 			Replicas: &replicas,
 			Main:     &aigridv1.ModelContainer{Image: "quay.io/example/vllm:latest"},
 		},
