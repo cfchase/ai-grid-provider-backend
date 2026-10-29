@@ -39,6 +39,10 @@ const (
 	// LLMInferenceService, so a read returns the placement without scanning
 	// every cluster index.
 	gitClustersAnnotation = "ai-grid/clusters"
+	// gitModelNameAnnotation keeps the model's spec.model.name on its
+	// LLMInferenceService, whose own spec.model.name is the id
+	// (servedModelName).
+	gitModelNameAnnotation = "ai-grid/model-name"
 	// gridProviderName is the ExternalProvider that publishes the grid
 	// gateway to MaaS on each ingress spoke.
 	gridProviderName = "grid-provider"
@@ -136,9 +140,6 @@ func (s *ModelsServer) gitCreate(ctx context.Context, object *aigridv1.Model) (*
 	if err := s.checkPlacementClusters(ctx, clusters); err != nil {
 		return nil, err
 	}
-	if err := checkServedNameFree(head, object, clusters); err != nil {
-		return nil, err
-	}
 	return s.gitCommitModel(ctx, head, "create", object, 1, nil, clusters)
 }
 
@@ -188,9 +189,6 @@ func (s *ModelsServer) gitUpdate(ctx context.Context, req *aigridv1.ModelsUpdate
 		}
 	}
 	if err := s.checkPlacementClusters(ctx, added); err != nil {
-		return nil, err
-	}
-	if err := checkServedNameFree(head, merged, clusters); err != nil {
 		return nil, err
 	}
 	return s.gitCommitModel(ctx, head, "update", merged, current.model.GetMetadata().GetVersion()+1, current.clusters, clusters)
@@ -455,7 +453,13 @@ func (s *ModelsServer) renderModelDeployment(object *aigridv1.Model, version int
 	}
 	annotations[gitVersionAnnotation] = strconv.FormatInt(int64(version), 10)
 	annotations[gitClustersAnnotation] = strings.Join(clusters, ",")
+	if name := object.GetSpec().GetModel().GetName(); name != "" {
+		annotations[gitModelNameAnnotation] = name
+	}
 	llm.SetAnnotations(annotations)
+	if err := unstructured.SetNestedField(llm.Object, servedModelName(object), "spec", "model", "name"); err != nil {
+		return nil, err
+	}
 
 	policy := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "networking.k8s.io/v1",
@@ -561,8 +565,12 @@ func parseGitModel(data []byte) (*gitModel, error) {
 	if s := annotations[gitClustersAnnotation]; s != "" {
 		clusters = strings.Split(s, ",")
 	}
+	if name, ok := annotations[gitModelNameAnnotation]; ok && model.Spec.GetModel() != nil {
+		model.Spec.Model.Name = name
+	}
 	delete(annotations, gitVersionAnnotation)
 	delete(annotations, gitClustersAnnotation)
+	delete(annotations, gitModelNameAnnotation)
 	if len(annotations) == 0 {
 		model.Metadata.Annotations = nil
 	}

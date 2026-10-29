@@ -57,7 +57,7 @@ func TestModelsGitGridFiles(t *testing.T) {
 		t.Fatalf("HTTPRoute path match = %v", p)
 	}
 	header := match["headers"].([]interface{})[0].(map[string]interface{})
-	if header["name"] != "X-Gateway-Model-Name" || header["type"] != "Exact" || header["value"] != "example/sim" {
+	if header["name"] != "X-Gateway-Model-Name" || header["type"] != "Exact" || header["value"] != "sim" {
 		t.Fatalf("HTTPRoute header match = %v", header)
 	}
 	backend := rule["backendRefs"].([]interface{})[0].(map[string]interface{})
@@ -78,7 +78,7 @@ func TestModelsGitGridFiles(t *testing.T) {
 	if selector, found, _ := unstructured.NestedMap(local.Object, "spec", "siteSelector"); found && len(selector) > 0 {
 		t.Fatalf("local InferenceProvider siteSelector = %v, want empty", selector)
 	}
-	assertProviderModels(t, local, "example/sim")
+	assertProviderModels(t, local, "sim")
 
 	if got := kustomizationResources(t, writer, "catalog/models/sim/catalog/kustomization.yaml"); !slices.Equal(got, []string{"grid.yaml", "model.yaml"}) {
 		t.Fatalf("catalog kustomization resources = %v", got)
@@ -114,69 +114,51 @@ func TestModelsGitGridPlacementChangeRewritesProviders(t *testing.T) {
 	}
 }
 
-// The served name is spec.model.name, or the id when the model has none, as
-// the ExternalModel's targetModel.
-func TestModelsGitGridServedNameDefaultsToID(t *testing.T) {
+// The grid routes by model id, the name tenants send in "model": MaaS lists the
+// model under its id and forwards the body unchanged, so the ExternalModel's
+// targetModel, the InferenceProviders, the HTTPRoute's header and vLLM's
+// served name are all the id. spec.model.name is kept for the API in an
+// annotation, so two models may serve the same Hugging Face model on one
+// cluster and still route apart.
+func TestModelsGitGridRoutesByID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	writer := gitops.NewMemoryWriter(nil)
 	srv := mustGitModelsServer(t, writer)
 
-	model := gitSampleModel("sim", "site-b")
-	model.Spec.Model.Name = ""
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: model}); err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	grid := readGitYAMLDocs(t, writer, "catalog/models/sim/deployment/grid.yaml")
-	rules, _, _ := unstructured.NestedSlice(grid[0].Object, "spec", "rules")
-	header := rules[0].(map[string]interface{})["matches"].([]interface{})[0].(map[string]interface{})["headers"].([]interface{})[0].(map[string]interface{})
-	if header["value"] != "sim" {
-		t.Fatalf("HTTPRoute header value = %v, want the id", header["value"])
-	}
-	assertProviderModels(t, grid[1], "sim")
-	peers := readGitYAMLDocs(t, writer, "catalog/models/sim/catalog/grid.yaml")
-	assertProviderModels(t, peers[0], "sim")
-}
-
-// Two models with one served name on one cluster would put two HTTPRoutes with
-// the same match on that cluster's models Gateway, so the second is refused.
-// On different clusters the name is the same model served in two places, so
-// it is accepted only from the same source (TestModelsGitGridServedNameSource).
-func TestModelsGitGridServedNameConflict(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	srv := mustGitModelsServer(t, gitops.NewMemoryWriter(nil))
-
-	shared := func(id string, clusters ...string) *aigridv1.Model {
-		model := gitSampleModel(id, clusters...)
+	for _, id := range []string{"first", "second"} {
+		model := gitSampleModel(id, "site-b")
 		model.Spec.Model.Name = "facebook/opt-125m"
-		return model
-	}
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("first", "site-a", "site-b")}); err != nil {
-		t.Fatalf("Create(first) error = %v", err)
-	}
-	_, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("second", "site-b")})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
-
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("elsewhere", "site-c")}); err != nil {
-		t.Fatalf("Create(elsewhere) error = %v, want a model on another cluster accepted", err)
-	}
-	_, err = srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
-		Object:     shared("elsewhere", "site-a"),
-		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.placement"}},
-	})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
-
-	// A model doesn't conflict with itself.
-	if _, err := srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
-		Object:     shared("first", "site-a"),
-		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.placement"}},
-	}); err != nil {
-		t.Fatalf("Update(first) error = %v", err)
-	}
-	other := gitSampleModel("other", "site-a")
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: other}); err != nil {
-		t.Fatalf("Create(other) error = %v, want another served name accepted", err)
+		if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: model}); err != nil {
+			t.Fatalf("Create(%s) error = %v", id, err)
+		}
+		llm := readGitYAMLDocs(t, writer, "catalog/models/"+id+"/deployment/deployment.yaml")[0]
+		if got, _, _ := unstructured.NestedString(llm.Object, "spec", "model", "name"); got != id {
+			t.Fatalf("%s: LLMInferenceService spec.model.name = %q, want the id (vLLM's served name)", id, got)
+		}
+		grid := readGitYAMLDocs(t, writer, "catalog/models/"+id+"/deployment/grid.yaml")
+		rules, _, _ := unstructured.NestedSlice(grid[0].Object, "spec", "rules")
+		header := rules[0].(map[string]interface{})["matches"].([]interface{})[0].(map[string]interface{})["headers"].([]interface{})[0].(map[string]interface{})
+		if header["value"] != id {
+			t.Fatalf("%s: HTTPRoute header value = %v, want the id", id, header["value"])
+		}
+		external := readGitYAMLDocs(t, writer, "catalog/models/"+id+"/catalog/model.yaml")[0]
+		refs, _, _ := unstructured.NestedSlice(external.Object, "spec", "externalProviderRefs")
+		if got := refs[0].(map[string]interface{})["targetModel"]; got != id {
+			t.Fatalf("%s: ExternalModel targetModel = %v, want the id", id, got)
+		}
+		got, err := srv.Get(ctx, &aigridv1.ModelsGetRequest{Id: id})
+		if err != nil {
+			t.Fatalf("Get(%s) error = %v", id, err)
+		}
+		if name := got.GetObject().GetSpec().GetModel().GetName(); name != "facebook/opt-125m" {
+			t.Fatalf("%s: Get spec.model.name = %q, want the name the caller set", id, name)
+		}
+		for k := range got.GetObject().GetMetadata().GetAnnotations() {
+			if strings.HasPrefix(k, "ai-grid/model-name") {
+				t.Fatalf("%s: Get returned internal annotation %q", id, k)
+			}
+		}
 	}
 }
 
@@ -253,53 +235,6 @@ func assertPeerProviders(t *testing.T, writer gitops.Writer, id string, clusters
 		if got, _, _ := unstructured.NestedStringMap(p.Object, "spec", "siteSelector", "matchLabels"); len(got) != 1 || got["ai-grid/site"] != cluster {
 			t.Fatalf("%s siteSelector = %v", p.GetName(), got)
 		}
-		assertProviderModels(t, p, "example/"+id)
+		assertProviderModels(t, p, id)
 	}
-}
-
-// An ingress cluster balances one served name across every site that serves
-// it, so two models may share the name only when they serve the same thing:
-// the same model URI and the same image. Otherwise tenants asking for the name
-// would get either model.
-func TestModelsGitGridServedNameSource(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	srv := mustGitModelsServer(t, gitops.NewMemoryWriter(nil))
-	shared := func(id, uri string, clusters ...string) *aigridv1.Model {
-		model := gitSampleModel(id, clusters...)
-		model.Spec.Model = &aigridv1.ModelSource{Uri: uri, Name: "shared/model"}
-		return model
-	}
-
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("first", "hf://org/one", "site-a")}); err != nil {
-		t.Fatalf("Create(first) error = %v", err)
-	}
-	_, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("other-uri", "hf://org/two", "site-b")})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
-	if err == nil || !strings.Contains(err.Error(), `"first"`) {
-		t.Fatalf("error = %v, want it to name model first", err)
-	}
-
-	otherImage := shared("other-image", "hf://org/one", "site-b")
-	otherImage.Spec.Main.Image = "quay.io/example/other:latest"
-	_, err = srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: otherImage})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
-
-	if _, err := srv.Create(ctx, &aigridv1.ModelsCreateRequest{Object: shared("same", "hf://org/one", "site-b")}); err != nil {
-		t.Fatalf("Create(same) error = %v, want the same source on another cluster accepted", err)
-	}
-
-	// An update that moves a sharing model to another source collides too.
-	_, err = srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
-		Object:     shared("same", "hf://org/two", "site-b"),
-		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.model"}},
-	})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
-	image := shared("same", "hf://org/one", "site-b")
-	image.Spec.Main.Image = "quay.io/example/other:latest"
-	_, err = srv.Update(ctx, &aigridv1.ModelsUpdateRequest{
-		Object:     image,
-		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.main.image"}},
-	})
-	assertConnectCode(t, err, connect.CodeAlreadyExists)
 }

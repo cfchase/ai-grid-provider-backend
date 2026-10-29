@@ -2,12 +2,9 @@ package servers
 
 import (
 	"maps"
-	"path"
-	"slices"
 
 	connect "connectrpc.com/connect/v2"
 	aigridv1 "github.com/osac-project/ai-grid-provider-backend/gen/ai_grid/v1"
-	"github.com/osac-project/ai-grid-provider-backend/internal/gitops"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -28,13 +25,14 @@ import (
 // The template installs the models Gateway, the backends and the GridSite
 // labels once per cluster; the backend writes only per-model objects.
 
-// servedModelName is the name the model answers to: spec.model.name, or the
-// id when it has none. The ExternalModel's targetModel, the HTTPRoute's
-// header match and the InferenceProviders' model all use it.
+// servedModelName is the name the grid routes the model by: its id. MaaS
+// lists the model under its id and forwards the request body unchanged (the
+// AI gateway applies an ExternalModel's targetModel only with API translation
+// on), so tenants send the id in "model", the ingress consumer routes on it,
+// and vLLM must serve it: renderModelDeployment sets the LLMInferenceService's
+// spec.model.name, vLLM's served name, to the id and keeps the caller's name in
+// gitModelNameAnnotation. Ids are unique, so no two models share a route.
 func servedModelName(object *aigridv1.Model) string {
-	if name := object.GetSpec().GetModel().GetName(); name != "" {
-		return name
-	}
 	return object.GetId()
 }
 
@@ -130,59 +128,6 @@ func gridInferenceProvider(name, id, served, backend string, siteLabels map[stri
 
 func gridLabels(id string) map[string]interface{} {
 	return stringMapToInterfaceMap(map[string]string{modelLabelKey: id, managedByLabelKey: managedByLabelValue})
-}
-
-// checkServedNameFree refuses a model whose served name another model already
-// serves, when the two would be confused:
-//
-//   - on a shared cluster, both HTTPRoutes would match the same header on that
-//     cluster's models Gateway;
-//   - on any cluster, from another source (model URI or image): an ingress
-//     cluster balances a name across every site serving it, so tenants asking
-//     for the name would get either model.
-//
-// The same source on other clusters is one model served in more places, and
-// is allowed.
-func checkServedNameFree(head gitops.Snapshot, object *aigridv1.Model, clusters []string) error {
-	resources, err := readKustomizationResources(head, ingressGitIndex)
-	if err != nil {
-		return err
-	}
-	id, served := object.GetId(), servedModelName(object)
-	for _, resource := range resources {
-		// ../models/<id>/catalog
-		other := path.Base(path.Dir(resource))
-		if other == id {
-			continue
-		}
-		data, err := head.Read(path.Join(modelDeploymentGitDir(other), "deployment.yaml"))
-		if err != nil {
-			return modelGitError("read", other, err)
-		}
-		current, err := parseGitModel(data)
-		if err != nil {
-			return connect.Errorf(connect.CodeInternal, "read model %q: %v", other, err).WithCause(err)
-		}
-		if servedModelName(current.model) != served {
-			continue
-		}
-		if !sameModelSource(current.model, object) {
-			return connect.Errorf(connect.CodeAlreadyExists, "Model %q already serves %q from another model URI or image; the grid routes by that name, so use another model name", other, served)
-		}
-		for _, cluster := range clusters {
-			if slices.Contains(current.clusters, cluster) {
-				return connect.Errorf(connect.CodeAlreadyExists, "Model %q already serves %q on cluster %q; the grid routes by that name, so use another model name or cluster", other, served, cluster)
-			}
-		}
-	}
-	return nil
-}
-
-// sameModelSource reports whether a and b serve the same thing: the same
-// model URI and the same main image.
-func sameModelSource(a, b *aigridv1.Model) bool {
-	return a.GetSpec().GetModel().GetUri() == b.GetSpec().GetModel().GetUri() &&
-		a.GetSpec().GetMain().GetImage() == b.GetSpec().GetMain().GetImage()
 }
 
 // validateModelGitMetadata is validateGitMetadata plus the models-only
